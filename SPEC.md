@@ -356,10 +356,9 @@ Shipped with the assembler and used in the rehearsal.
 1. ~~Snapshot timing.~~ Decided 2026-11-23: a window, with the slot picked from a later blockhash (§3).
 2. ~~First come, first served.~~ Decided 2026-11-23: one per wallet for the first 24 hours, then
    first come, first served (§4).
-3. **Treasury half.** Draft: half of every chain's fees goes to a treasury address (multisig) fixed at
-   deploy. MiniChain gives it to chain #1's holder instead.
-4. **The fee rate** `FEE_LAMPORTS_PER_MCU`. Solana fees are tiny, so holders earn little unless a
-   chain is busy.
-5. **Sweep** sends users' leftover balances to the holder (as in MiniChain). Keep, or return each
-   balance to its owner (costs a claim instruction per user)?
+3. ~~Treasury half.~~ Decided 2026-11-23: half of every chain's fees goes to a treasury multisig fixed
+   at deploy.
+4. ~~The fee rate.~~ Decided 2026-11-23: `FEE_LAMPORTS_PER_MCU` = 1,000,000 (1 lamport per metered
+   compute unit, about 0.00004 SOL for a typical app call).
+5. ~~Sweep.~~ Decided 2026-11-23: leftover balances go to the holder, as in MiniChain (§13).
 6. **Audit** before mainnet.
