@@ -1,0 +1,10 @@
+**/node_modules
+.git
+.env*
+target
+.anchor
+test-ledger
+programs
+scripts
+test
+*.keypair.json

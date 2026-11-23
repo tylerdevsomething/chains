@@ -66,6 +66,45 @@ function encode(t: IdlType, v: unknown): Buffer {
   throw new Error('unsupported type');
 }
 
+function decode(t: IdlType, d: Buffer, o: { at: number }): unknown {
+  const take = (n: number) => { const b = d.subarray(o.at, o.at + n); if (b.length < n) throw new Error('short data'); o.at += n; return b; };
+  if (typeof t === 'string') {
+    switch (t) {
+      case 'u8': return take(1)[0];
+      case 'bool': return take(1)[0] !== 0;
+      case 'u32': return take(4).readUInt32LE();
+      case 'u64': return take(8).readBigUInt64LE();
+      case 'i64': return take(8).readBigInt64LE();
+      case 'pubkey': return new PublicKey(take(32));
+      case 'bytes': return new Uint8Array(take(take(4).readUInt32LE()));
+      case 'string': return take(take(4).readUInt32LE()).toString('utf8');
+    }
+    throw new Error(`unsupported type ${t}`);
+  }
+  if ('array' in t) {
+    const [inner, n] = t.array;
+    if (inner === 'u8') return new Uint8Array(take(n));
+    return Array.from({ length: n }, () => decode(inner, d, o));
+  }
+  if ('vec' in t) return Array.from({ length: take(4).readUInt32LE() }, () => decode(t.vec, d, o));
+  if ('option' in t) return take(1)[0] ? decode(t.option, d, o) : null;
+  throw new Error('unsupported type');
+}
+
+export type DecodedIx = { name: string; args: Record<string, unknown>; accounts: Record<string, PublicKey> };
+
+/** Decodes one of this program's instructions: its name, arguments and named accounts. */
+export function decodeIx(data: Buffer, accountKeys: PublicKey[]): DecodedIx | null {
+  const def = IDL.instructions.find((i: { discriminator: number[] }) => Buffer.from(i.discriminator).equals(data.subarray(0, 8)));
+  if (!def) return null;
+  const o = { at: 8 };
+  const args: Record<string, unknown> = {};
+  for (const a of def.args as { name: string; type: IdlType }[]) args[a.name.replace(/^_/, '')] = decode(a.type, data, o);
+  const accounts: Record<string, PublicKey> = {};
+  (def.accounts as { name: string }[]).forEach((a, i) => { if (accountKeys[i]) accounts[a.name] = accountKeys[i]; });
+  return { name: def.name, args, accounts };
+}
+
 const FIXED: Record<string, () => PublicKey> = {
   system_program: () => SystemProgram.programId,
   mpl_core_program: () => MPL_CORE_ID,

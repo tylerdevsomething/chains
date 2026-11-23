@@ -1,0 +1,186 @@
+// The Chains service: the follower, the explorer API (/api), the renderer (/chain/<id>.json and
+// .svg) and the site (site/). One process, no build step.
+//
+//   node indexer/server.ts
+//
+// Env: RPC_URL (default devnet; keep a private RPC server-side), CLUSTER (devnet | mainnet-beta, for
+// explorer links), PORT (default 8080), DATA_DIR (optional: caches history between restarts),
+// PUBLIC_ORIGIN (optional: the site's URL for asset metadata; else taken from the request).
+
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { readFile, stat } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
+import { extname, join, normalize } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { Connection } from '@solana/web3.js';
+import { PROGRAM_ID, pda, type Header } from '../tools/chains.ts';
+import { assemble, disassemble } from '../tools/asm.ts';
+import { svg, metadata, traits, type ArtInput } from '../renderer/art.ts';
+import { Follower, codeHashOf } from './follower.ts';
+
+const RPC_URL = process.env.RPC_URL ?? 'https://api.devnet.solana.com';
+const CLUSTER = process.env.CLUSTER ?? 'devnet';
+const PORT = Number(process.env.PORT ?? 8080);
+const SITE = fileURLToPath(new URL('../site/', import.meta.url));
+const MAX_CHAINS = 500;
+
+const conn = new Connection(RPC_URL, 'confirmed');
+const follower = new Follower(conn, process.env.DATA_DIR ?? null);
+
+// Known apps, by code hash.
+const KNOWN = new Map<string, string>();
+for (const [name, file] of [['Swap', 'swap.asm'], ['Collection', 'collection.asm']]) {
+  KNOWN.set(codeHashOf(assemble(readFileSync(new URL(`../tools/apps/${file}`, import.meta.url), 'utf8'))), name);
+}
+
+const now = () => Math.floor(Date.now() / 1000);
+const ended = (h: Header | null) => !!h && (h.status === 1 || (h.expiry > 0n && BigInt(now()) >= h.expiry));
+
+function artInput(id: number): ArtInput & { name: string } {
+  const row = follower.chains.get(id);
+  const h = row?.header ?? null;
+  return {
+    id,
+    name: h?.name ?? '',
+    stage: !row ? 'unclaimed' : row.stage,
+    height: h?.height ?? 0n,
+    lamportsHeld: h?.totalDeposits ?? 0n,
+    feesEarned: h?.feesAccrued ?? 0n,
+    ended: ended(h),
+  };
+}
+
+function headerJson(h: Header) {
+  return {
+    name: h.name,
+    status: ended(h) ? (h.status === 1 ? 'swept' : 'ended') : 'running',
+    height: Number(h.height),
+    head: Buffer.from(h.head).toString('hex'),
+    expiry: Number(h.expiry),
+    launchedAt: Number(h.launchedAt),
+    totalDeposits: h.totalDeposits.toString(),
+    feesAccrued: h.feesAccrued.toString(),
+    feesClaimed: h.feesClaimed.toString(),
+  };
+}
+
+function chainSummary(id: number) {
+  const row = follower.chains.get(id);
+  const t = traits(artInput(id));
+  return {
+    id,
+    stage: row?.stage ?? 'unclaimed',
+    holder: row?.holder ?? null,
+    stone: t.stone.name,
+    cut: t.cut,
+    ...(row?.header ? headerJson(row.header) : {}),
+  };
+}
+
+const origin = (req: IncomingMessage) =>
+  process.env.PUBLIC_ORIGIN ?? `${(req.headers['x-forwarded-proto'] as string) ?? 'http'}://${req.headers['x-forwarded-host'] ?? req.headers.host}`;
+
+function send(res: ServerResponse, status: number, body: string | Buffer, type: string, cache = 'no-cache') {
+  res.writeHead(status, { 'content-type': type, 'cache-control': cache, 'access-control-allow-origin': '*' });
+  res.end(body);
+}
+const json = (res: ServerResponse, v: unknown, status = 200) => send(res, status, JSON.stringify(v), 'application/json');
+
+async function api(path: string, req: IncomingMessage, res: ServerResponse) {
+  if (path === '/api/health') return json(res, { ok: true, updatedAt: follower.updatedAt });
+
+  if (path === '/api/overview') {
+    const r = follower.registry;
+    const rows = [...follower.chains.values()];
+    const sum = (f: (h: Header) => bigint) => rows.reduce((a, x) => a + (x.header ? f(x.header) : 0n), 0n).toString();
+    return json(res, {
+      cluster: CLUSTER,
+      programId: PROGRAM_ID.toBase58(),
+      maxChains: MAX_CHAINS,
+      updatedAt: follower.updatedAt,
+      registry: r && {
+        treasury: r.treasury.toBase58(),
+        chainsMint: r.chainsMint.toBase58(),
+        collection: r.collection.toBase58(),
+        snapshotSlot: Number(r.snapshotSlot),
+        claimed: r.claimed,
+        feeLamportsPerMcu: r.feeLamportsPerMcu.toString(),
+      },
+      launched: rows.filter((x) => x.header).length,
+      running: rows.filter((x) => x.header && !ended(x.header)).length,
+      totalDeposits: sum((h) => h.totalDeposits),
+      feesAccrued: sum((h) => h.feesAccrued),
+      operations: sum((h) => h.height),
+    });
+  }
+
+  if (path === '/api/chains') {
+    return json(res, Array.from({ length: MAX_CHAINS }, (_, i) => chainSummary(i + 1)));
+  }
+
+  let m = /^\/api\/chain\/(\d+)$/.exec(path);
+  if (m) {
+    const id = Number(m[1]);
+    if (id < 1 || id > MAX_CHAINS) return json(res, { error: 'no such chain' }, 404);
+    const row = follower.chains.get(id);
+    const base = { ...chainSummary(id), asset: pda.asset(id).toBase58(), address: pda.chain(id).toBase58(), state: pda.state(id).toBase58() };
+    if (!row?.header) return json(res, { ...base, apps: [], accounts: [], history: [], verified: true });
+    const [apps, accounts] = await Promise.all([follower.apps(id), follower.accounts(id)]);
+    const h = follower.history.get(id);
+    return json(res, {
+      ...base,
+      apps: apps.map((a) => ({ ...a, name: KNOWN.get(a.codeHash) ?? null })),
+      accounts,
+      history: (h?.blocks ?? []).slice(-500).reverse(),
+      historyComplete: (h?.blocks.length ?? 0) === Number(row.header.height),
+      verified: h?.verified ?? true,
+    });
+  }
+
+  m = /^\/api\/chain\/(\d+)\/app\/([1-9A-HJ-NP-Za-km-z]{32,44})$/.exec(path);
+  if (m) {
+    const id = Number(m[1]);
+    const c = await follower.code(id, m[2]);
+    if (!c) return json(res, { error: 'no such app' }, 404);
+    const hash = codeHashOf(c.code);
+    return json(res, { address: m[2], creator: c.creator, len: c.code.length, codeHash: hash, name: KNOWN.get(hash) ?? null, disassembly: disassemble(c.code) });
+  }
+
+  return json(res, { error: 'not found' }, 404);
+}
+
+const TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
+  '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json',
+};
+
+async function serve(req: IncomingMessage, res: ServerResponse) {
+  const url = new URL(req.url ?? '/', 'http://x');
+  const path = decodeURIComponent(url.pathname);
+  try {
+    if (path.startsWith('/api/')) return await api(path, req, res);
+
+    const art = /^\/chain\/(\d+)\.(svg|json)$/.exec(path);
+    if (art) {
+      const id = Number(art[1]);
+      if (id < 1 || id > MAX_CHAINS) return send(res, 404, 'not found', 'text/plain');
+      const a = artInput(id);
+      return art[2] === 'svg'
+        ? send(res, 200, svg(a), 'image/svg+xml', 'public, max-age=30')
+        : send(res, 200, JSON.stringify(metadata(a, origin(req)), null, 2), 'application/json', 'public, max-age=30');
+    }
+
+    const rel = normalize(path === '/' ? '/index.html' : path).replace(/^([/\\])+/, '');
+    const file = join(SITE, rel);
+    if (!file.startsWith(SITE)) return send(res, 403, 'forbidden', 'text/plain');
+    const s = await stat(file).catch(() => null);
+    if (s?.isFile()) return send(res, 200, await readFile(file), TYPES[extname(file)] ?? 'application/octet-stream', 'public, max-age=60');
+    return send(res, 200, await readFile(join(SITE, 'index.html')), TYPES['.html']);
+  } catch (e) {
+    console.error(path, e);
+    if (!res.headersSent) json(res, { error: 'internal error' }, 500);
+  }
+}
+
+createServer(serve).listen(PORT, () => console.log(`chains: http://localhost:${PORT} (${CLUSTER}, program ${PROGRAM_ID.toBase58()})`));
+follower.run();
