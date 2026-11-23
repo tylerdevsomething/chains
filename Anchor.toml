@@ -1,0 +1,16 @@
+[toolchain]
+anchor_version = "0.31.1"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+chains = "J42AjNw2JV9CHsm7Cp4wrrnahZMe5XKodhumsSHZDr1G"
+
+[programs.devnet]
+chains = "J42AjNw2JV9CHsm7Cp4wrrnahZMe5XKodhumsSHZDr1G"
+
+[provider]
+cluster = "localnet"
+wallet = "/mnt/c/Users/Admin/chains-keys/localnet-admin.json"
