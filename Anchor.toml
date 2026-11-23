@@ -6,10 +6,10 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-chains = "J42AjNw2JV9CHsm7Cp4wrrnahZMe5XKodhumsSHZDr1G"
+chains = "9mmzy5stpZfxmtQTWFC1fDDhWn8FwYMTwWTAkv5tLb3N"
 
 [programs.devnet]
-chains = "J42AjNw2JV9CHsm7Cp4wrrnahZMe5XKodhumsSHZDr1G"
+chains = "9mmzy5stpZfxmtQTWFC1fDDhWn8FwYMTwWTAkv5tLb3N"
 
 [provider]
 cluster = "localnet"

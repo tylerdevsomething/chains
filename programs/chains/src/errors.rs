@@ -96,6 +96,10 @@ pub enum ChainsError {
     NotCreator,
     #[msg("Write past the end of the code")]
     WriteOutOfRange,
+    #[msg("Claims are not open yet")]
+    ClaimsNotOpen,
+    #[msg("One chain per wallet during the first claim window")]
+    OnePerWallet,
 }
 
 pub fn vm_err(e: VmError) -> Error {

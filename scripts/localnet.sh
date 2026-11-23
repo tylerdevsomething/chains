@@ -12,5 +12,5 @@ export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
 mkdir -p "$WORK"
 [ -f "$WORK/mpl_core.so" ] || solana program dump -u https://api.mainnet-beta.solana.com CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d "$WORK/mpl_core.so"
 exec solana-test-validator --reset --quiet --ledger "$WORK/test-ledger" \
-  --upgradeable-program J42AjNw2JV9CHsm7Cp4wrrnahZMe5XKodhumsSHZDr1G "$REPO/target/deploy/chains.so" "$ADMIN" \
+  --upgradeable-program 9mmzy5stpZfxmtQTWFC1fDDhWn8FwYMTwWTAkv5tLb3N "$REPO/target/deploy/chains.so" "$ADMIN" \
   --bpf-program CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d "$WORK/mpl_core.so"

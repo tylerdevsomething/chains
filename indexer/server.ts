@@ -5,18 +5,20 @@
 //
 // Env: RPC_URL (default devnet; keep a private RPC server-side), CLUSTER (devnet | mainnet-beta, for
 // explorer links), PORT (default 8080), DATA_DIR (optional: caches history between restarts),
-// PUBLIC_ORIGIN (optional: the site's URL for asset metadata; else taken from the request).
+// PUBLIC_ORIGIN (optional: the site's URL for asset metadata; else taken from the request),
+// SNAPSHOT_FILE (the published snapshot.csv; default deploy/snapshot.<CLUSTER>.csv).
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Connection } from '@solana/web3.js';
+import { Connection, PublicKey } from '@solana/web3.js';
 import { PROGRAM_ID, pda, type Header } from '../tools/chains.ts';
 import { assemble, disassemble } from '../tools/asm.ts';
 import { svg, metadata, traits, type ArtInput } from '../renderer/art.ts';
 import { Follower, codeHashOf } from './follower.ts';
+import { Claims } from './claims.ts';
 
 const RPC_URL = process.env.RPC_URL ?? 'https://api.devnet.solana.com';
 const CLUSTER = process.env.CLUSTER ?? 'devnet';
@@ -26,6 +28,7 @@ const MAX_CHAINS = 500;
 
 const conn = new Connection(RPC_URL, 'confirmed');
 const follower = new Follower(conn, process.env.DATA_DIR ?? null);
+const claims = new Claims(conn, process.env.SNAPSHOT_FILE ?? fileURLToPath(new URL(`../deploy/snapshot.${CLUSTER}.csv`, import.meta.url)));
 
 // Known apps, by code hash.
 const KNOWN = new Map<string, string>();
@@ -86,7 +89,7 @@ function send(res: ServerResponse, status: number, body: string | Buffer, type: 
 }
 const json = (res: ServerResponse, v: unknown, status = 200) => send(res, status, JSON.stringify(v), 'application/json');
 
-async function api(path: string, req: IncomingMessage, res: ServerResponse) {
+async function api(path: string, url: URL, req: IncomingMessage, res: ServerResponse) {
   if (path === '/api/health') return json(res, { ok: true, updatedAt: follower.updatedAt });
 
   if (path === '/api/overview') {
@@ -103,6 +106,7 @@ async function api(path: string, req: IncomingMessage, res: ServerResponse) {
         chainsMint: r.chainsMint.toBase58(),
         collection: r.collection.toBase58(),
         snapshotSlot: Number(r.snapshotSlot),
+        claimsOpenAt: Number(r.claimsOpenAt),
         claimed: r.claimed,
         feeLamportsPerMcu: r.feeLamportsPerMcu.toString(),
       },
@@ -146,6 +150,22 @@ async function api(path: string, req: IncomingMessage, res: ServerResponse) {
     return json(res, { address: m[2], creator: c.creator, len: c.code.length, codeHash: hash, name: KNOWN.get(hash) ?? null, disassembly: disassemble(c.code) });
   }
 
+  m = /^\/api\/claim\/([1-9A-HJ-NP-Za-km-z]{32,44})(\/tx)?$/.exec(path);
+  if (m) {
+    let wallet: PublicKey;
+    try {
+      wallet = new PublicKey(m[1]);
+    } catch {
+      return json(res, { error: 'not a wallet address' }, 400);
+    }
+    if (!m[2]) return json(res, await claims.status(wallet));
+    try {
+      return json(res, await claims.tx(wallet, Number(url.searchParams.get('n') ?? 1)));
+    } catch (e) {
+      return json(res, { error: (e as Error).message }, 400);
+    }
+  }
+
   return json(res, { error: 'not found' }, 404);
 }
 
@@ -158,7 +178,7 @@ async function serve(req: IncomingMessage, res: ServerResponse) {
   const url = new URL(req.url ?? '/', 'http://x');
   const path = decodeURIComponent(url.pathname);
   try {
-    if (path.startsWith('/api/')) return await api(path, req, res);
+    if (path.startsWith('/api/')) return await api(path, url, req, res);
 
     const art = /^\/chain\/(\d+)\.(svg|json)$/.exec(path);
     if (art) {

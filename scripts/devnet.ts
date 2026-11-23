@@ -48,15 +48,19 @@ async function step(name: string, f: () => Promise<void>) {
 
 const admin = loadKey(ADMIN_PATH);
 const treasury = admin.publicKey;
-const [A, B, C, D] = ['A', 'B', 'C', 'D'].map(wallet);
+const [A, B, C, D, E] = ['A', 'B', 'C', 'D', 'E'].map(wallet);
 const auth = { launch_authority: admin.publicKey };
-const snap = new Snapshot([{ wallet: A.publicKey, claims: 3 }, { wallet: B.publicKey, claims: 2 }, { wallet: C.publicKey, claims: 1 }]);
+// E is never claimed here: import its key into a wallet to try the site's claim page.
+const snap = new Snapshot([{ wallet: A.publicKey, claims: 3 }, { wallet: B.publicKey, claims: 2 }, { wallet: C.publicKey, claims: 1 }, { wallet: E.publicKey, claims: 3 }]);
+// The published file the site serves claims from (indexer/claims.ts).
+writeFileSync(new URL('../deploy/snapshot.devnet.csv', import.meta.url), snap.file());
 const cuLog: string[] = [];
+const now = async () => BigInt((await conn.getBlockTime(await conn.getSlot('confirmed')))!);
 const startBalance = await conn.getBalance(admin.publicKey);
 console.log(`rpc ${RPC}\nadmin ${admin.publicKey.toBase58()} ${startBalance / LAMPORTS_PER_SOL} SOL`);
 
 await step('fund test wallets', async () => {
-  for (const [k, target] of [[A, 600n], [B, 400n], [C, 300n], [D, 60n]] as const) {
+  for (const [k, target] of [[A, 600n], [B, 400n], [C, 300n], [D, 60n], [E, 50n]] as const) {
     const have = BigInt(await conn.getBalance(k.publicKey));
     const want = target * MILLI;
     if (have < want / 2n) {
@@ -79,10 +83,14 @@ await step('mint and snapshot (once)', async () => {
   if (r.chainsMint.equals(PublicKey.default)) await c.send([admin], ix('set_mint', auth, { mint: Keypair.generate().publicKey }));
   await c.fails(c.send([admin], ix('set_mint', auth, { mint: Keypair.generate().publicKey })), 'AlreadySet');
   r = decodeRegistry((await conn.getAccountInfo(pda.registry()))!.data);
-  if (r.snapshotSlot === 0n) await c.send([admin], ix('set_snapshot', auth, { slot: BigInt(await conn.getSlot()), root: snap.root, hash: snap.fileHash() }));
+  if (r.snapshotSlot === 0n) await c.send([admin], ix('set_snapshot', auth, {
+    slot: BigInt(await conn.getSlot()), root: snap.root, hash: snap.fileHash(),
+    // Opened a day ago less 60s: the one-per-wallet window closes a minute from now.
+    claims_open_at: (await now()) - DAY + 60n,
+  }));
   r = decodeRegistry((await conn.getAccountInfo(pda.registry()))!.data);
   assert.deepEqual(new Uint8Array(r.snapshotRoot), new Uint8Array(snap.root), 'registry holds this snapshot (keys in CHAINS_DEVNET_KEYS)');
-  await c.fails(c.send([admin], ix('set_snapshot', auth, { slot: 1n, root: snap.root, hash: snap.fileHash() })), 'AlreadySet');
+  await c.fails(c.send([admin], ix('set_snapshot', auth, { slot: 1n, root: snap.root, hash: snap.fileHash(), claims_open_at: 0n })), 'AlreadySet');
 });
 
 const claim = (k: Keypair, n: number, first: number, claims?: number) => {
@@ -92,34 +100,39 @@ const claim = (k: Keypair, n: number, first: number, claims?: number) => {
     Array.from({ length: n }, (_, j) => ({ pubkey: pda.asset(first + j), isSigner: false, isWritable: true }))));
 };
 
-await step('claim: proofs, per-wallet limits, ids in order', async () => {
-  const claimed = async () => decodeRegistry((await conn.getAccountInfo(pda.registry()))!.data).claimed;
-  if ((await claimed()) === 0) {
+await step('claim: one per wallet first, then limits, ids in order', async () => {
+  const reg = async () => decodeRegistry((await conn.getAccountInfo(pda.registry()))!.data);
+  if ((await reg()).claimed === 0) {
     await c.fails(claim(B, 1, 1, 5), 'NotListed');
-    await claim(A, 3, 1);
-    await c.fails(claim(A, 1, 4), 'TooManyClaims');
-    await claim(B, 2, 4);
+    await c.fails(claim(A, 2, 1), 'OnePerWallet');
+    await claim(A, 1, 1);
+    await c.fails(claim(A, 1, 2), 'OnePerWallet');
+    await claim(B, 1, 2);
+    const windowEnds = (await reg()).claimsOpenAt + DAY;
+    while ((await now()) < windowEnds + 2n) await new Promise((r) => setTimeout(r, 2000));
+    await claim(A, 2, 3);
+    await c.fails(claim(A, 1, 5), 'TooManyClaims');
+    await claim(B, 1, 5);
     await claim(C, 1, 6);
   }
-  assert.equal(await claimed(), 6);
-  for (const [id, k] of [[1, A], [3, A], [4, B], [6, C]] as const) {
+  assert.equal((await reg()).claimed, 6);
+  for (const [id, k] of [[1, A], [2, B], [3, A], [4, A], [5, B], [6, C]] as const) {
     const d = (await conn.getAccountInfo(pda.asset(id)))!.data;
     assert.ok(new PublicKey(d.subarray(1, 33)).equals(k.publicKey), `chain ${id} owner`);
   }
 });
 
-const now = async () => BigInt((await conn.getBlockTime(await conn.getSlot('confirmed')))!);
 const launch = (k: Keypair, id: number, expiry: bigint) => c.send([k], ix('launch', { holder: k.publicKey, ...chainAccounts(id) }, { id, expiry }));
 
 await step('launch: holder only, end date rule, block 1', async () => {
   if (!(await conn.getAccountInfo(pda.chain(1)))) {
-    await c.fails(launch(A, 4, 0n), 'NotHolder');
-    await c.fails(launch(A, 2, (await now()) + DAY), 'BadExpiry');
+    await c.fails(launch(A, 2, 0n), 'NotHolder');
+    await c.fails(launch(A, 3, (await now()) + DAY), 'BadExpiry');
     c.track(await launch(A, 1, 0n), [opHash('launch', A.publicKey.toBytes(), i64be(0n))]);
-    c.track(await launch(A, 2, (await now()) + 31n * DAY));
+    c.track(await launch(A, 3, (await now()) + 31n * DAY));
   }
   await c.follow(1);
-  await c.follow(2);
+  await c.follow(3);
   assert.ok((await c.header(1)).height >= 1n);
   await assert.rejects(launch(A, 1, 0n), 'a chain launches once');
 });
@@ -240,17 +253,17 @@ await step('collection: create, mint at price, cap, transfer', async () => {
   await c.fails(call(B, 1, coll.address, 0n, words(3n, 1n, B.publicKey.toBytes()), codes), 'RequireFailed');
 });
 
-await step('chain 2: deposit and a plain transfer', async () => {
-  await dep(B, B.publicKey, 30n * MILLI, 2);
-  const d0 = balanceOf(await c.state(2), D.publicKey);
-  await call(B, 2, D.publicKey.toBytes(), 10n * MILLI, Buffer.alloc(0), []);
-  assert.equal(balanceOf(await c.state(2), D.publicKey), d0 + 10n * MILLI);
-  const pay = { registry: pda.registry(), ...chainAccounts(2), holder: A.publicKey, treasury };
-  await c.fails(c.send([D], ix('sweep', pay, { id: 2 })), 'NotEnded');
+await step('chain 3: deposit and a plain transfer', async () => {
+  await dep(B, B.publicKey, 30n * MILLI, 3);
+  const d0 = balanceOf(await c.state(3), D.publicKey);
+  await call(B, 3, D.publicKey.toBytes(), 10n * MILLI, Buffer.alloc(0), []);
+  assert.equal(balanceOf(await c.state(3), D.publicKey), d0 + 10n * MILLI);
+  const pay = { registry: pda.registry(), ...chainAccounts(3), holder: A.publicKey, treasury };
+  await c.fails(c.send([D], ix('sweep', pay, { id: 3 })), 'NotEnded');
 });
 
 await step('history and backing: header matches every block seen', async () => {
-  for (const id of [1, 2]) {
+  for (const id of [1, 3]) {
     const h = await c.header(id);
     assert.deepEqual(new Uint8Array(h.head), c.heads.get(id)!.head);
     assert.equal(h.height, c.heads.get(id)!.height);

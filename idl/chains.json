@@ -1,5 +1,5 @@
 {
-  "address": "J42AjNw2JV9CHsm7Cp4wrrnahZMe5XKodhumsSHZDr1G",
+  "address": "9mmzy5stpZfxmtQTWFC1fDDhWn8FwYMTwWTAkv5tLb3N",
   "metadata": {
     "name": "chains",
     "version": "0.1.0",
@@ -863,7 +863,7 @@
         },
         {
           "name": "this_program",
-          "address": "J42AjNw2JV9CHsm7Cp4wrrnahZMe5XKodhumsSHZDr1G"
+          "address": "9mmzy5stpZfxmtQTWFC1fDDhWn8FwYMTwWTAkv5tLb3N"
         },
         {
           "name": "program_data"
@@ -1314,6 +1314,10 @@
               32
             ]
           }
+        },
+        {
+          "name": "claims_open_at",
+          "type": "i64"
         }
       ]
     },
@@ -2039,6 +2043,16 @@
       "code": 6041,
       "name": "WriteOutOfRange",
       "msg": "Write past the end of the code"
+    },
+    {
+      "code": 6042,
+      "name": "ClaimsNotOpen",
+      "msg": "Claims are not open yet"
+    },
+    {
+      "code": 6043,
+      "name": "OnePerWallet",
+      "msg": "One chain per wallet during the first claim window"
     }
   ],
   "types": [
@@ -2349,6 +2363,14 @@
               "Lamports per million compute units (§11). Set once at initialize, never changed."
             ],
             "type": "u64"
+          },
+          {
+            "name": "claims_open_at",
+            "docs": [
+              "When claiming opens (unix seconds), set with the snapshot. One chain per wallet for the",
+              "first PRIORITY_WINDOW seconds."
+            ],
+            "type": "i64"
           },
           {
             "name": "uri_base",

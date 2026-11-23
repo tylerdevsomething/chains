@@ -19,7 +19,7 @@ use state::*;
 use table::Table;
 use vm::{Host, Vm, Word};
 
-declare_id!("J42AjNw2JV9CHsm7Cp4wrrnahZMe5XKodhumsSHZDr1G");
+declare_id!("9mmzy5stpZfxmtQTWFC1fDDhWn8FwYMTwWTAkv5tLb3N");
 
 /// Metered compute units for a transaction (§11): a fixed schedule calibrated to real compute,
 /// because the compute-units syscall is not active on devnet or mainnet.
@@ -144,7 +144,7 @@ pub mod chains {
         Ok(())
     }
 
-    pub fn set_snapshot(ctx: Context<Authority>, slot: u64, root: [u8; 32], hash: [u8; 32]) -> Result<()> {
+    pub fn set_snapshot(ctx: Context<Authority>, slot: u64, root: [u8; 32], hash: [u8; 32], claims_open_at: i64) -> Result<()> {
         let r = &mut ctx.accounts.registry;
         require!(r.snapshot_slot == 0, ChainsError::AlreadySet);
         require!(r.chains_mint != Pubkey::default(), ChainsError::SnapshotNotSet);
@@ -152,6 +152,7 @@ pub mod chains {
         r.snapshot_slot = slot;
         r.snapshot_root = root;
         r.snapshot_hash = hash;
+        r.claims_open_at = claims_open_at;
         Ok(())
     }
 
@@ -160,10 +161,15 @@ pub mod chains {
         let wallet = ctx.accounts.claimer.key();
         let r = &ctx.accounts.registry;
         require!(r.snapshot_slot != 0, ChainsError::SnapshotNotSet);
+        let now = Clock::get()?.unix_timestamp;
+        require!(now >= r.claims_open_at, ChainsError::ClaimsNotOpen);
         require!(n >= 1 && ctx.remaining_accounts.len() == n as usize, ChainsError::BadArgument);
         require!(merkle::verify(&proof, merkle::leaf(&wallet.to_bytes(), total_claims), &r.snapshot_root), ChainsError::NotListed);
         let rec = &mut ctx.accounts.claim_record;
         require!(rec.used as u64 + n as u64 <= total_claims as u64, ChainsError::TooManyClaims);
+        if now < r.claims_open_at.saturating_add(PRIORITY_WINDOW) {
+            require!(rec.used + n as u32 <= 1, ChainsError::OnePerWallet);
+        }
         require!(r.claimed + n as u32 <= MAX_CHAINS, ChainsError::SoldOut);
         rec.wallet = wallet;
         rec.used += n as u32;

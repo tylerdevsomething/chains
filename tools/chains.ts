@@ -210,8 +210,9 @@ export function decodeRegistry(d: Buffer) {
   o += 32; // snapshot hash
   const snapshotSlot = d.readBigUInt64LE(o); o += 8;
   const claimed = d.readUInt32LE(o); o += 4;
-  const feeLamportsPerMcu = d.readBigUInt64LE(o);
-  return { launchAuthority, treasury, chainsMint, collection, snapshotRoot, snapshotSlot, claimed, feeLamportsPerMcu };
+  const feeLamportsPerMcu = d.readBigUInt64LE(o); o += 8;
+  const claimsOpenAt = d.readBigInt64LE(o);
+  return { launchAuthority, treasury, chainsMint, collection, snapshotRoot, snapshotSlot, claimed, feeLamportsPerMcu, claimsOpenAt };
 }
 
 // ---------------------------------------------------------------- history and events

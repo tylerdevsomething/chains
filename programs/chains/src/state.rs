@@ -7,8 +7,13 @@ pub const MAX_CHAINS: u32 = 6;
 
 #[cfg(not(feature = "localnet"))]
 pub const MIN_EXPIRY: i64 = 30 * 24 * 60 * 60;
+/// After claims open, each wallet can claim one chain until this much time has passed (§4).
+#[cfg(not(feature = "localnet"))]
+pub const PRIORITY_WINDOW: i64 = 24 * 60 * 60;
 #[cfg(feature = "localnet")]
 pub const MIN_EXPIRY: i64 = 5;
+#[cfg(feature = "localnet")]
+pub const PRIORITY_WINDOW: i64 = 8;
 
 pub const NAME_MAX: usize = 24;
 pub const URI_BASE_MAX: usize = 100;
@@ -49,6 +54,9 @@ pub struct Registry {
     pub claimed: u32,
     /// Lamports per million compute units (§11). Set once at initialize, never changed.
     pub fee_lamports_per_mcu: u64,
+    /// When claiming opens (unix seconds), set with the snapshot. One chain per wallet for the
+    /// first PRIORITY_WINDOW seconds.
+    pub claims_open_at: i64,
     /// The renderer's base URL, ending in "/": assets point at `<uri_base>chain/<id>.json`.
     #[max_len(100)]
     pub uri_base: String,

@@ -33,6 +33,7 @@ Inspired by MiniChain on Ethereum. Chains is an independent design for Solana.
 | `CHAINS_SUPPLY` | 1,000,000,000 | pump.fun fixed supply, 6 decimals (verify on the live mint) |
 | `TOKENS_PER_CLAIM` | 1,000,000 $CHAINS | Each full million held at the snapshot = one claim |
 | `MIN_EXPIRY` | 30 days | Shortest end date allowed at launch; 0 = never ends |
+| `PRIORITY_WINDOW` | 24 hours | After claims open, one chain per wallet for this long (§4) |
 | `NAME_MAX` | 24 chars | Letters, digits, hyphens, inner spaces |
 | `MAX_STEPS` | 10,000 | Per top-level call; compute is the real ceiling (§10) |
 | `MAX_DEPTH` | 8 | Nested guest calls |
@@ -48,40 +49,54 @@ Inspired by MiniChain on Ethereum. Chains is an independent design for Solana.
 $CHAINS is a memecoin launched on pump.fun. Its only job is deciding who can claim chains. It is
 never used inside a chain.
 
-1. **Snapshot slot.** A slot `S` is announced in advance (§19 Q1). Balances are read as of the end
-   of `S`, from finalized transactions only.
+1. **Snapshot slot. [decision]** Nobody, including us, knows `S` until it has passed, and anyone
+   can check how it was picked:
+   - We announce a window of slots `[W0, W1]` and a reveal slot `R` at least 150 slots after `W1`.
+   - Once `R` is finalized, `S = W0 + (x mod (W1 − W0 + 1))`. `x` is the first 8 bytes, big-endian,
+     of `keccak256("chains:snapshot" ‖ blockhash)`, where `blockhash` is the 32-byte blockhash of
+     `R`. If `R` was skipped, the next slot that has a block is used.
+   - `tools/snapshot-slot.ts W0 W1 R` computes it.
+   - Balances are read as of the end of `S`, from finalized transactions only. If `S` was skipped,
+     that's the state after the last block before it.
 2. **Who counts.** A wallet's balance is the sum of every $CHAINS token account it owns. Only owners
    that are **on-curve ed25519 keys** count. That leaves out every PDA automatically: the pump.fun
    bonding curve, PumpSwap pool vaults, other program vaults and multisig vaults.
 3. **Claims.** `claims = floor(balance / TOKENS_PER_CLAIM)`. 2.5M held = 2 claims. A wallet below
    1M gets nothing.
-4. **How it's computed.** The indexer replays every $CHAINS transfer, mint and burn from the mint's
-   creation up to `S` and builds the balance table. It is deterministic: the same transactions give
-   the same table, byte for byte.
+4. **How it's computed.** `indexer/build-snapshot.ts` finds every token account that ever held
+   $CHAINS (from every transaction that touched the mint). Then it reads each account's balance and
+   owner from its last transaction at or before `S` (`postTokenBalances`). An account closed by
+   then counts as zero. It is deterministic: the same finalized history gives the same table, byte
+   for byte. It also publishes every owner's balance, and why any were left out.
 5. **Publishing.** The list of `(wallet, claims)` sorted by wallet is published as a file, with its
    SHA-256 and a Merkle root. The root is posted on chain once by `set_snapshot` (§4). Anyone can
    rebuild the file and check the root. Leaf = `keccak256(0x00 ‖ wallet ‖ claims as u32 BE)`,
    node = `keccak256(0x01 ‖ smaller child ‖ larger child)`, leaves in wallet order, an odd node at
    the end of a level moves up unchanged.
-6. Total claims will very likely be more than 500. Claiming is first come, first served (§4).
+6. Total claims will very likely be more than 500. One per wallet comes first, then first come,
+   first served (§4).
 
 ## 4. The registry and claiming
 
 The **registry** PDA `["registry"]` holds: `launch_authority`, `treasury`, `snapshot_root`,
-`snapshot_hash`, `snapshot_slot`, `claimed` (count), `chains_mint` (the $CHAINS mint), and the
-Metaplex Core collection.
+`snapshot_hash`, `snapshot_slot`, `claims_open_at`, `claimed` (count), `chains_mint` (the $CHAINS
+mint), and the Metaplex Core collection.
 
 | Instruction | Who | What |
 |---|---|---|
 | `initialize(launch_authority, treasury, fee_lamports_per_mcu, uri_base)` | The program's upgrade authority | Creates the registry and the Core collection (update authority = registry PDA). All four values are fixed from then on |
 | `set_mint(mint)` | `launch_authority`, once | Records the $CHAINS mint right after it exists |
-| `set_snapshot(slot, root, hash)` | `launch_authority`, once | Fixes the snapshot. Cannot be changed afterwards |
+| `set_snapshot(slot, root, hash, claims_open_at)` | `launch_authority`, once | Fixes the snapshot and when claiming opens (unix seconds). Cannot be changed afterwards |
 | `claim(proof, total_claims, n)` | The listed wallet | Mints `n` chain NFTs to the signer |
 
 `claim` rules:
 
 - The proof must show `(signer, total_claims)` is in `snapshot_root`.
 - A `ClaimRecord` PDA `["claimed", wallet]` counts how many the wallet has used. `used + n ≤ total_claims`.
+- Before `claims_open_at`, claims fail with `ClaimsNotOpen`.
+- **[decision] One per wallet first.** For the first `PRIORITY_WINDOW` after `claims_open_at`, each
+  wallet can claim one chain in total (`OnePerWallet`). After that, any wallet with claims left can
+  use them, first come, first served.
 - `claimed + n ≤ MAX_CHAINS`. The 501st claim fails with `SoldOut`.
 - Chain ids are given out in order, starting at 1.
 - Claiming doesn't spend, burn or lock any $CHAINS.
@@ -338,11 +353,9 @@ Shipped with the assembler and used in the rehearsal.
 
 ## 19. Open questions
 
-1. **Snapshot timing.** The page says it's announced in advance. That invites buying just before and
-   dumping just after. Alternative: announce a window, and pick the slot inside it from a blockhash
-   committed beforehand.
-2. **First come, first served.** Bots win rushes, and total claims will likely be well over 500.
-   Alternatives: a first window where each wallet gets one guaranteed claim, or order by snapshot balance.
+1. ~~Snapshot timing.~~ Decided 2026-11-23: a window, with the slot picked from a later blockhash (§3).
+2. ~~First come, first served.~~ Decided 2026-11-23: one per wallet for the first 24 hours, then
+   first come, first served (§4).
 3. **Treasury half.** Draft: half of every chain's fees goes to a treasury address (multisig) fixed at
    deploy. MiniChain gives it to chain #1's holder instead.
 4. **The fee rate** `FEE_LAMPORTS_PER_MCU`. Solana fees are tiny, so holders earn little unless a

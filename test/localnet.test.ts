@@ -69,40 +69,52 @@ test('localnet rehearsal', { skip: up ? false : `no validator at ${RPC}`, timeou
       Array.from({ length: n }, (_, j) => ({ pubkey: pda.asset(first + j), isSigner: false, isWritable: true }))));
   };
 
+  const now = async () => BigInt((await conn.getBlockTime(await conn.getSlot('confirmed')))!);
+  const until = async (t: bigint) => { while ((await now()) < t) await new Promise((r) => setTimeout(r, 500)); };
+  let opensAt = 0n;
+
   await t.test('mint and snapshot are set once', async () => {
-    await fails(send([admin], ix('set_snapshot', auth, { slot: 1n, root: snap.root, hash: snap.fileHash() })), 'SnapshotNotSet');
+    await fails(send([admin], ix('set_snapshot', auth, { slot: 1n, root: snap.root, hash: snap.fileHash(), claims_open_at: 0n })), 'SnapshotNotSet');
     await fails(send([A], ix('set_mint', { launch_authority: A.publicKey }, { mint: Keypair.generate().publicKey })), 'Unauthorized');
     await send([admin], ix('set_mint', auth, { mint: Keypair.generate().publicKey }));
     await fails(send([admin], ix('set_mint', auth, { mint: Keypair.generate().publicKey })), 'AlreadySet');
-    await send([admin], ix('set_snapshot', auth, { slot: 123n, root: snap.root, hash: snap.fileHash() }));
-    await fails(send([admin], ix('set_snapshot', auth, { slot: 124n, root: snap.root, hash: snap.fileHash() })), 'AlreadySet');
+    opensAt = (await now()) + 3n;
+    await send([admin], ix('set_snapshot', auth, { slot: 123n, root: snap.root, hash: snap.fileHash(), claims_open_at: opensAt }));
+    await fails(send([admin], ix('set_snapshot', auth, { slot: 124n, root: snap.root, hash: snap.fileHash(), claims_open_at: 0n })), 'AlreadySet');
+    assert.equal(decodeRegistry((await conn.getAccountInfo(pda.registry()))!.data).claimsOpenAt, opensAt);
   });
 
-  await t.test('claim: proofs, per-wallet limits, ids in order, SoldOut', async () => {
+  await t.test('claim: opening time, one per wallet first, limits, ids in order, SoldOut', async () => {
+    await fails(claim(A, 1, 1), 'ClaimsNotOpen');
+    await until(opensAt);
     await fails(claim(B, 1, 1, 5), 'NotListed');
-    await claim(A, 3, 1);
-    await fails(claim(A, 1, 4), 'TooManyClaims');
-    await claim(B, 2, 4);
+    await fails(claim(A, 2, 1), 'OnePerWallet');
+    await claim(A, 1, 1);
+    await fails(claim(A, 1, 2), 'OnePerWallet');
+    await claim(B, 1, 2);
+    await until(opensAt + 8n); // localnet PRIORITY_WINDOW
+    await claim(A, 2, 3);
+    await fails(claim(A, 1, 5), 'TooManyClaims');
+    await claim(B, 1, 5);
     await fails(claim(C, 2, 6), 'SoldOut');
     await claim(C, 1, 6);
     await fails(claim(C, 1, 7), 'SoldOut');
-    for (const [id, k] of [[1, A], [3, A], [4, B], [6, C]] as const) {
+    for (const [id, k] of [[1, A], [2, B], [3, A], [4, A], [5, B], [6, C]] as const) {
       const d = (await conn.getAccountInfo(pda.asset(id)))!.data;
       assert.ok(new PublicKey(d.subarray(1, 33)).equals(k.publicKey), `chain ${id} owner`);
     }
   });
 
-  const now = async () => BigInt((await conn.getBlockTime(await conn.getSlot('confirmed')))!);
   const launch = (k: Keypair, id: number, expiry: bigint) =>
     send([k], ix('launch', { holder: k.publicKey, ...chainAccounts(id) }, { id, expiry }));
   let endsAt = 0n;
 
   await t.test('launch: holder only, end date rule, block 1', async () => {
-    await fails(launch(A, 4, 0n), 'NotHolder');
-    await fails(launch(A, 2, (await now()) + 1n), 'BadExpiry');
+    await fails(launch(A, 2, 0n), 'NotHolder');
+    await fails(launch(A, 3, (await now()) + 1n), 'BadExpiry');
     track(await launch(A, 1, 0n), [opHash('launch', A.publicKey.toBytes(), i64be(0n))]);
     endsAt = (await now()) + 40n;
-    track(await launch(A, 2, endsAt));
+    track(await launch(A, 3, endsAt));
     const h = await header(1);
     assert.equal(h.height, 1n);
     assert.deepEqual(h.head, c.heads.get(1)!.head);
@@ -260,31 +272,31 @@ test('localnet rehearsal', { skip: up ? false : `no validator at ${RPC}`, timeou
   });
 
   await t.test('end date and sweep', async () => {
-    track(await dep(B, B.publicKey, 3n * SOL, 2));
-    track(await call(B, 2, D.publicKey.toBytes(), SOL, Buffer.alloc(0), [])); // a plain transfer, with a fee
-    assert.equal(balanceOf(await state(2), D.publicKey), SOL);
-    const pay = { registry: pda.registry(), ...chainAccounts(2), holder: A.publicKey, treasury };
-    await fails(send([D], ix('sweep', pay, { id: 2 })), 'NotEnded');
+    track(await dep(B, B.publicKey, 3n * SOL, 3));
+    track(await call(B, 3, D.publicKey.toBytes(), SOL, Buffer.alloc(0), [])); // a plain transfer, with a fee
+    assert.equal(balanceOf(await state(3), D.publicKey), SOL);
+    const pay = { registry: pda.registry(), ...chainAccounts(3), holder: A.publicKey, treasury };
+    await fails(send([D], ix('sweep', pay, { id: 3 })), 'NotEnded');
     while ((await now()) < endsAt) await new Promise((r) => setTimeout(r, 1000));
     await new Promise((r) => setTimeout(r, 1500));
-    await fails(dep(B, B.publicKey, SOL, 2), 'ChainEnded');
-    await fails(send([D], ix('claim_fees', pay, { id: 2 })), 'ChainEnded');
+    await fails(dep(B, B.publicKey, SOL, 3), 'ChainEnded');
+    await fails(send([D], ix('claim_fees', pay, { id: 3 })), 'ChainEnded');
 
-    const h = await header(2);
+    const h = await header(3);
     const fees = h.feesAccrued - h.feesClaimed;
-    const stateLamports = BigInt(await conn.getBalance(pda.state(2)));
+    const stateLamports = BigInt(await conn.getBalance(pda.state(3)));
     const aBefore = BigInt(await conn.getBalance(A.publicKey));
     const tBefore = BigInt(await conn.getBalance(treasury));
-    const s = await send([D], ix('sweep', pay, { id: 2 }));
+    const s = await send([D], ix('sweep', pay, { id: 3 }));
     assert.equal(BigInt(await conn.getBalance(treasury)) - tBefore, fees / 2n);
     assert.equal(BigInt(await conn.getBalance(A.publicKey)) - aBefore, h.totalDeposits - fees / 2n + stateLamports);
-    assert.equal(await conn.getAccountInfo(pda.state(2)), null, 'state account closed');
-    const after = await header(2);
+    assert.equal(await conn.getAccountInfo(pda.state(3)), null, 'state account closed');
+    const after = await header(3);
     assert.equal(after.status, 1);
     assert.equal(after.totalDeposits, 0n);
     assert.equal(after.height, h.height, 'header keeps its final head and height');
     assert.ok(s.events.some((e) => e.name === 'Swept'));
-    await fails(send([D], ix('sweep', pay, { id: 2 })), 'AlreadySwept');
+    await fails(send([D], ix('sweep', pay, { id: 3 })), 'AlreadySwept');
   });
 
   t.diagnostic(`compute: ${cuLog.join(', ')}`);

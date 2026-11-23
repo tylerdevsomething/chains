@@ -1,6 +1,8 @@
 // The Chains site: overview, all chains, a chain explorer and app pages. Plain JS, no build step.
 // Data comes from the service's /api (indexer/server.ts); art from /chain/<id>.svg.
 
+import { claimPage } from './claim.js';
+
 const app = document.getElementById('app');
 let overview = null;
 
@@ -63,7 +65,7 @@ async function home() {
 
     <h2>How it works</h2>
     <div class="cards">
-      <div class="card"><div class="n">01 · Claim</div><h3>Hold $CHAINS</h3><p>Every 1,000,000 $CHAINS held at the snapshot is one claim. Claims are first come, first served, and claiming doesn't burn your tokens.</p></div>
+      <div class="card"><div class="n">01 · Claim</div><h3>Hold $CHAINS</h3><p>Every 1,000,000 $CHAINS held at the snapshot is one claim. One chain per wallet first, then first come, first served. Claiming doesn't burn your tokens.</p></div>
       <div class="card"><div class="n">02 · Launch</div><h3>Start your chain</h3><p>The holder launches the chain and picks an end date, or none. From then on anyone can deposit SOL and deploy apps to it.</p></div>
       <div class="card"><div class="n">03 · Use</div><h3>Every op is a transaction</h3><p>Apps run in a small VM inside the program. Every deposit, call and deploy is a Solana transaction, recorded in the chain's own hash-linked history.</p></div>
       <div class="card"><div class="n">04 · Earn</div><h3>Half the fees</h3><p>Each call pays a small fee in SOL. Half goes to whoever holds the chain's NFT, half to the treasury. Sell the NFT and the income goes with it.</p></div>
@@ -254,16 +256,15 @@ async function appPage(id, address) {
 // ------------------------------------------------------------------ own a chain
 
 async function own() {
-  const o = overview;
   app.innerHTML = `
     <div style="max-width:760px;padding-top:28px">
       <h1 style="font-size:40px">Own a chain</h1>
       <p class="lead muted" style="font-size:17px">There are 500 chains. They go to $CHAINS holders, and after that they trade as NFTs.</p>
       <h2>1. Hold $CHAINS at the snapshot</h2>
-      <p>Each 1,000,000 $CHAINS in your wallet at the snapshot is one claim. The snapshot list, its hash and its Merkle root are published, so anyone can check it against the token's public history.</p>
+      <p>Each 1,000,000 $CHAINS in your wallet at the snapshot is one claim. Nobody knows the exact snapshot slot in advance, us included: we announce a window, and the slot inside it is picked from a later Solana blockhash that anyone can check. The list, its hash and its Merkle root are published, so anyone can rebuild it from the token's public history.</p>
       <h2>2. Claim</h2>
-      <p>Claims are first come, first served, in order of chain number. Claiming doesn't burn or lock your tokens. Each claim mints a chain NFT to your wallet.</p>
-      <div class="note">${o.registry?.snapshotSlot && o.cluster !== 'mainnet-beta' ? 'This is the devnet preview. The snapshot here is a test list, and claiming is done by the test scripts.' : 'Claiming opens after the snapshot. The claim page will be here.'}</div>
+      <p>For the first 24 hours after claiming opens, each wallet can claim one chain. After that, wallets with claims left use them, first come, first served, until all 500 are gone. Claiming doesn't burn or lock your tokens. Each claim mints a chain NFT to your wallet.</p>
+      <p><a class="btn primary" href="#/claim">Go to the claim page</a></p>
       <h2>3. Launch, or sell</h2>
       <p>Launch your chain to start earning: you pick the end date (at least 30 days away, or never). Or sell the NFT on any marketplace that lists Metaplex Core assets. Whoever holds it gets the holder's half of the fees.</p>
       <h2>What the holder can and can't do</h2>
@@ -282,12 +283,13 @@ async function route() {
   const h = location.hash.replace(/^#/, '') || '/';
   const parts = h.split('/').filter(Boolean);
   document.querySelectorAll('nav a').forEach((a) => a.classList.toggle('on',
-    (a.dataset.nav === 'home' && parts.length === 0) || (a.dataset.nav === 'chains' && (parts[0] === 'chains' || parts[0] === 'chain')) || (a.dataset.nav === 'own' && parts[0] === 'own')));
+    (a.dataset.nav === 'home' && parts.length === 0) || (a.dataset.nav === 'chains' && (parts[0] === 'chains' || parts[0] === 'chain')) || (a.dataset.nav === 'own' && (parts[0] === 'own' || parts[0] === 'claim'))));
   try {
     if (!overview) await loadOverview();
     if (parts.length === 0) await home();
     else if (parts[0] === 'chains') await chains();
     else if (parts[0] === 'own') await own();
+    else if (parts[0] === 'claim') await claimPage(app, overview, exTx);
     else if (parts[0] === 'chain' && parts[2] === 'app') await appPage(Number(parts[1]), parts[3]);
     else if (parts[0] === 'chain') await chain(Number(parts[1]));
     else await home();
