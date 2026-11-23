@@ -10,8 +10,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 COPY idl ./idl
-COPY tools/chains.ts tools/asm.ts ./tools/
-COPY tools/apps ./tools/apps
+COPY tools ./tools
 COPY renderer ./renderer
 COPY indexer ./indexer
 COPY site ./site
