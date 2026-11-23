@@ -17,6 +17,8 @@ pub const PRIORITY_WINDOW: i64 = 8;
 
 pub const NAME_MAX: usize = 24;
 pub const URI_BASE_MAX: usize = 100;
+/// Bytes of table space per entry, for storage rent (§6): a 272-byte page holds 4 entries.
+pub const ENTRY_BYTES: usize = 68;
 pub const FEE_OVERHEAD_CU: u64 = 20_000;
 /// The fee meter (§11). Calibrated on localnet against real compute.
 pub const CU_PER_STEP: u64 = 250;

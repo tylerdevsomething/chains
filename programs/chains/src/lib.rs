@@ -104,6 +104,25 @@ fn check_backed(header: &AccountInfo, total_deposits: u64) -> Result<()> {
     Ok(())
 }
 
+/// Rent for one table entry (§6): a page holds 4 entries in 272 bytes.
+fn entry_rent() -> Result<u64> {
+    let r = Rent::get()?;
+    Ok(r.minimum_balance(ENTRY_BYTES) - r.minimum_balance(0))
+}
+
+/// Rent for the entries an operation added (net), from the table's entry count before and after.
+fn new_entries_rent(before: u64, after: u64) -> Result<u64> {
+    Ok(after.saturating_sub(before) * entry_rent()?)
+}
+
+/// Pays storage rent in real SOL from a signer into the state account.
+fn pay_rent<'info>(payer: &AccountInfo<'info>, state: &AccountInfo<'info>, system: &AccountInfo<'info>, rent: u64) -> Result<()> {
+    if rent > 0 {
+        system_program::transfer(CpiContext::new(system.clone(), system_program::Transfer { from: payer.clone(), to: state.clone() }), rent)?;
+    }
+    Ok(())
+}
+
 fn move_lamports(from: &AccountInfo, to: &AccountInfo, amount: u64) -> Result<()> {
     **from.try_borrow_mut_lamports()? = from.lamports().checked_sub(amount).ok_or(ChainsError::InsufficientBalance)?;
     **to.try_borrow_mut_lamports()? += amount;
@@ -305,11 +324,14 @@ pub mod chains {
             ),
             lamports,
         )?;
-        {
+        let rent = {
             let mut data = ctx.accounts.state.try_borrow_mut_data()?;
             let mut l = Ledger::new(Table::open(&mut data).map_err(table_err)?);
+            let before = l.t.count();
             l.credit(&beneficiary.to_bytes(), lamports).map_err(vm_err)?;
-        }
+            new_entries_rent(before, l.t.count())?
+        };
+        pay_rent(&ctx.accounts.payer.to_account_info(), &ctx.accounts.state.to_account_info(), &ctx.accounts.system_program.to_account_info(), rent)?;
         let h = &mut ctx.accounts.header;
         h.total_deposits = h.total_deposits.checked_add(lamports).ok_or(ChainsError::BadArgument)?;
         check_backed(&ctx.accounts.header.to_account_info(), ctx.accounts.header.total_deposits)?;
@@ -355,9 +377,10 @@ pub mod chains {
         let rate = ctx.accounts.registry.fee_lamports_per_mcu;
 
         let env = TxEnv::new(ctx.remaining_accounts, id);
-        let (nonce, result, fee, logs) = {
+        let (nonce, result, fee, rent, logs) = {
             let mut sd = ctx.accounts.state.try_borrow_mut_data()?;
             let mut l = Ledger::new(Table::open(&mut sd).map_err(table_err)?);
+            let before = l.t.count();
             require!(!l.is_guest(&sender), ChainsError::GuestSigner);
             let nonce = l.use_nonce(&sender).map_err(vm_err)?;
             let (result, steps) = {
@@ -369,15 +392,20 @@ pub mod chains {
             // The fee transfer below is one debit and one credit: 2 writes, counted in advance.
             let units = tx_units(steps, l.reads.get(), l.writes + 2, l.logs.len() as u64, data.len() as u64);
             let fee = chain_fee(units, rate);
-            require!(fee <= max_fee, ChainsError::FeeTooHigh);
             l.transfer(&sender, &chain_addr, fee).map_err(vm_err)?;
+            // Storage rent for every entry this call added, from the sender's balance (§6).
+            let rent = new_entries_rent(before, l.t.count())?;
+            require!(fee.checked_add(rent).ok_or(ChainsError::FeeTooHigh)? <= max_fee, ChainsError::FeeTooHigh);
+            l.debit(&sender, rent).map_err(vm_err)?;
             if cfg!(feature = "localnet") {
                 msg!("meter real={} units={} steps={} reads={} writes={} logs={}", real, units, steps, l.reads.get(), l.writes, l.logs.len());
             }
-            (nonce, result, fee, std::mem::take(&mut l.logs))
+            (nonce, result, fee, rent, std::mem::take(&mut l.logs))
         };
         drop(env);
         ctx.accounts.header.fees_accrued += fee;
+        ctx.accounts.header.total_deposits -= rent;
+        move_lamports(&ctx.accounts.header.to_account_info(), &ctx.accounts.state.to_account_info(), rent)?;
         emit_logs!(ctx, logs);
         let res_hash = vm::keccak(&[result.as_ref().map(|w| &w[..]).unwrap_or(&[])]);
         commit!(
@@ -417,15 +445,17 @@ pub mod chains {
         running(&ctx.accounts.header, Clock::get()?.unix_timestamp)?;
         require!(len >= 1 && len as usize <= vm::MAX_CODE, ChainsError::CodeTooLong);
         let creator = ctx.accounts.creator.key();
-        let nonce = {
+        let (nonce, rent_due) = {
             let mut sd = ctx.accounts.state.try_borrow_mut_data()?;
             let mut l = Ledger::new(Table::open(&mut sd).map_err(table_err)?);
+            let before = l.t.count();
             require!(!l.is_guest(&creator.to_bytes()), ChainsError::GuestSigner);
             let nonce = l.use_nonce(&creator.to_bytes()).map_err(vm_err)?;
             require!(guest_address(id, &creator, nonce, &salt) == address, ChainsError::BadAddress);
             require!(!l.is_guest(&address), ChainsError::AddressOccupied);
-            nonce
+            (nonce, new_entries_rent(before, l.t.count())?)
         };
+        pay_rent(&ctx.accounts.creator.to_account_info(), &ctx.accounts.state.to_account_info(), &ctx.accounts.system_program.to_account_info(), rent_due)?;
         // Prepay rent for the full code; deploy_write grows the account to it.
         let rent = Rent::get()?;
         let extra = rent.minimum_balance(CODE_HDR + len as usize) - rent.minimum_balance(CODE_HDR);
@@ -477,9 +507,10 @@ pub mod chains {
             vm::keccak(&[code])
         };
         let chain_addr = ctx.accounts.header.key().to_bytes();
-        let fee = {
+        let (fee, rent) = {
             let mut sd = ctx.accounts.state.try_borrow_mut_data()?;
             let mut l = Ledger::new(Table::open(&mut sd).map_err(table_err)?);
+            let before = l.t.count();
             require!(!l.is_guest(&address), ChainsError::AddressOccupied);
             l.mark_guest(&address).map_err(vm_err)?;
             let real = cu_start.saturating_sub(cu_left());
@@ -488,10 +519,14 @@ pub mod chains {
             if cfg!(feature = "localnet") {
                 msg!("meter real={} units={} seal len={}", real, units, len);
             }
-            require!(fee <= max_fee, ChainsError::FeeTooHigh);
             l.transfer(&creator.to_bytes(), &chain_addr, fee).map_err(vm_err)?;
-            fee
+            let rent = new_entries_rent(before, l.t.count())?;
+            require!(fee.checked_add(rent).ok_or(ChainsError::FeeTooHigh)? <= max_fee, ChainsError::FeeTooHigh);
+            l.debit(&creator.to_bytes(), rent).map_err(vm_err)?;
+            (fee, rent)
         };
+        ctx.accounts.header.total_deposits -= rent;
+        move_lamports(&ctx.accounts.header.to_account_info(), &ctx.accounts.state.to_account_info(), rent)?;
         let c = &mut ctx.accounts.code;
         c.sealed = true;
         c.code_hash = code_hash;

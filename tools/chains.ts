@@ -3,7 +3,7 @@
 
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { PublicKey, TransactionInstruction, SystemProgram, type AccountMeta } from '@solana/web3.js';
+import { PublicKey, TransactionInstruction, SystemProgram, type AccountMeta, type Connection } from '@solana/web3.js';
 import { keccak_256 } from '@noble/hashes/sha3';
 
 export const IDL = JSON.parse(readFileSync(new URL('../idl/chains.json', import.meta.url), 'utf8'));
@@ -173,6 +173,9 @@ export const balanceOf = (state: Buffer, addr: PublicKey | Uint8Array) =>
 export const nonceOf = (state: Buffer, addr: PublicKey) => wordToBig(tableGet(state, ledgerKey(KIND.nonce, addr.toBytes())));
 export const storageAt = (state: Buffer, guest: Uint8Array, slot: Uint8Array) => tableGet(state, ledgerKey(KIND.storage, guest, slot));
 export const tableCount = (state: Buffer) => state.readBigUInt64LE(32);
+/** Storage rent per table entry (SPEC §6: 68 bytes, paid by whoever adds the entry). */
+export const entryRent = async (conn: Connection) =>
+  BigInt(await conn.getMinimumBalanceForRentExemption(68)) - BigInt(await conn.getMinimumBalanceForRentExemption(0));
 
 /** Guest address (§8): keccak256("chains:guest" ‖ chain id ‖ creator ‖ nonce ‖ salt). */
 export const guestAddress = (id: number, creator: PublicKey, nonce: bigint, salt: Uint8Array) =>

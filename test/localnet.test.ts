@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, TransactionInstruction } from '@solana/web3.js';
 import {
-  ix, pda, MPL_CORE_ID, chainAccounts, balanceOf, nonceOf, guestAddress, decodeRegistry, opHash, u64be, keccak, type Event,
+  ix, pda, MPL_CORE_ID, chainAccounts, balanceOf, nonceOf, tableCount, entryRent, guestAddress, decodeRegistry, opHash, u64be, keccak, type Event,
 } from '../tools/chains.ts';
 import { Client } from '../tools/client.ts';
 import { assemble, word } from '../tools/asm.ts';
@@ -183,6 +183,8 @@ test('localnet rehearsal', { skip: up ? false : `no validator at ${RPC}`, timeou
     const codes = [swap.codeAcc];
     const h0 = await header(1);
     const a0 = balanceOf(await state(1), A.publicKey);
+  const n0 = tableCount(await state(1));
+  const stateLamports0 = BigInt(await conn.getBalance(pda.state(1)));
     const seeded = track(await call(A, 1, swap.address, 2n * SOL, words(1n, 'Ruby Gem', 'RUBY'), codes));
     cuLog.push(`seed ${seeded.cu} CU`);
     assert.equal(big(seeded.ret!), 1_000_000n);
@@ -192,7 +194,11 @@ test('localnet rehearsal', { skip: up ? false : `no validator at ${RPC}`, timeou
     const h1 = await header(1);
     const fee = h1.feesAccrued - h0.feesAccrued;
     assert.ok(fee > 20_000n, `fee ${fee} covers the overhead`);
-    assert.equal(balanceOf(await state(1), A.publicKey), a0 - 2n * SOL - fee);
+    // Storage rent for the new entries comes out of the sender's balance and into the state account.
+    const rent = (tableCount(await state(1)) - n0) * await entryRent(conn);
+    assert.ok(rent > 0n, 'seeding stores new entries');
+    assert.ok(BigInt(await conn.getBalance(pda.state(1))) - stateLamports0 >= rent, 'rent moved to the state account');
+    assert.equal(balanceOf(await state(1), A.publicKey), a0 - 2n * SOL - fee - rent);
     assert.equal(balanceOf(await state(1), pda.chain(1)), h1.feesAccrued - h1.feesClaimed);
 
     // B buys with 1 SOL: 0.3% to the seeder, the rest priced on x*y=k.

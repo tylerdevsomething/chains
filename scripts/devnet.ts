@@ -12,7 +12,7 @@
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram } from '@solana/web3.js';
-import { ix, pda, chainAccounts, balanceOf, nonceOf, guestAddress, decodeRegistry, opHash, u64be, keccak, type Event } from '../tools/chains.ts';
+import { ix, pda, chainAccounts, balanceOf, nonceOf, tableCount, entryRent, guestAddress, decodeRegistry, opHash, u64be, keccak, type Event } from '../tools/chains.ts';
 import { assemble, word } from '../tools/asm.ts';
 import { Snapshot } from '../tools/snapshot.ts';
 import { Client } from '../tools/client.ts';
@@ -115,7 +115,7 @@ await step('claim: one per wallet first, then limits, ids in order', async () =>
     await claim(B, 1, 5);
     await claim(C, 1, 6);
   }
-  assert.equal((await reg()).claimed, 6);
+  assert.ok((await reg()).claimed >= 6, 'the rehearsal claimed chains 1-6 (E may claim more on the site)');
   for (const [id, k] of [[1, A], [2, B], [3, A], [4, A], [5, B], [6, C]] as const) {
     const d = (await conn.getAccountInfo(pda.asset(id)))!.data;
     assert.ok(new PublicKey(d.subarray(1, 33)).equals(k.publicKey), `chain ${id} owner`);
@@ -197,6 +197,8 @@ await step('swap: seed, buy, sell, reads, fees', async () => {
   const seedSol = 50n * MILLI;
   const h0 = await c.header(1);
   const a0 = balanceOf(await c.state(1), A.publicKey);
+  const n0 = tableCount(await c.state(1));
+  const stateLamports0 = BigInt(await conn.getBalance(pda.state(1)));
   const seeded = await call(A, 1, swap.address, seedSol, words(1n, 'Ruby Gem', 'RUBY'), codes);
   cuLog.push(`seed ${seeded.cu} CU`);
   assert.equal(big(seeded.ret!), 1_000_000n);
@@ -204,7 +206,11 @@ await step('swap: seed, buy, sell, reads, fees', async () => {
   const fee = h1.feesAccrued - h0.feesAccrued;
   assert.ok(fee > 20_000n, `fee ${fee} covers the overhead`);
   console.log(`    seed fee ${fee} lamports`);
-  assert.equal(balanceOf(await c.state(1), A.publicKey), a0 - seedSol - fee);
+  // Storage rent for the new entries comes out of the sender's balance and into the state account.
+    const rent = (tableCount(await c.state(1)) - n0) * await entryRent(conn);
+    assert.ok(rent > 0n, 'seeding stores new entries');
+    assert.ok(BigInt(await conn.getBalance(pda.state(1))) - stateLamports0 >= rent, 'rent moved to the state account');
+    assert.equal(balanceOf(await c.state(1), A.publicKey), a0 - seedSol - fee - rent);
 
   const amt = 20n * MILLI;
   const aBefore = balanceOf(await c.state(1), A.publicKey);

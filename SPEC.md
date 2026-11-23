@@ -140,10 +140,21 @@ grows one bucket at a time and no transaction ever rehashes the whole table. Byt
 `launch` creates the state account even if someone has already sent lamports to its address
 (otherwise anyone could block a chain's launch for ~0.0009 SOL).
 
-**Rent.** Space costs rent on Solana (~6.96 SOL per MB). A call that needs new space must be
-preceded, in the same transaction, by `grow(id, bytes)`, paid in real SOL by the transaction's fee
-payer (up to 10 KB per instruction). Clients find out how much by simulating. Rent is not a chain fee
-and goes to nobody; it comes back when the chain is swept (§13).
+**Rent.** Space costs rent on Solana (~6.96 SOL per MB).
+- **[decision] Whoever adds an entry pays its rent.** Each operation that leaves the table with more
+  entries than before pays rent for 68 bytes per new entry (a 272-byte page holds 4), about
+  0.00047 SOL. The lamports move into the state account.
+  - `transact` and `deploy_seal` take it from the sender's internal balance (it counts toward
+    `max_fee`, and `total_deposits` drops by the same amount).
+  - `deposit` and `deploy_begin` take it in real SOL from the signer.
+  - Deleting an entry (storing zero, or a balance reaching zero) refunds nothing.
+- So storage can't be filled cheaply at others' expense: before this rule, a new entry cost its
+  writer ~300 lamports while its space cost ~470,000.
+- A call that needs new space must still be preceded, in the same transaction, by
+  `grow(id, bytes)` (up to 10 KB per instruction). `grow` uses the rent already in the state
+  account first; the fee payer covers only any shortfall. Clients find out by simulating.
+- Rent is not a chain fee and goes to nobody; it comes back to the holder when the chain is
+  swept (§13).
 
 ## 7. The ledger
 
@@ -259,8 +270,8 @@ fee = (units + FEE_OVERHEAD_CU) × FEE_LAMPORTS_PER_MCU / 1,000,000
   - `FEE_OVERHEAD_CU` = 20,000 covers the rest: transaction base cost, events and history.
   The schedule was calibrated on localnet against real compute and is within about ±30% for the
   example apps. It is part of the program, so it is frozen like the rate.
-- The sender sets `max_fee`. A higher fee fails with `FeeTooHigh`; a short balance fails with
-  `InsufficientBalance`.
+- The sender sets `max_fee`, which covers the chain fee plus any storage rent (§6). More fails with
+  `FeeTooHigh`; a short balance fails with `InsufficientBalance`.
 - Deposits, withdrawals, reads and fee claims pay no chain fee. Failed operations pay nothing.
 - The rate is frozen at deploy. Nobody can change it.
 - The fee is credited to the chain's own address inside the ledger (`fees_accrued`).
