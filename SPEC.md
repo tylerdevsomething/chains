@@ -137,6 +137,9 @@ balance, nonce and guest), values are 32 bytes, and zero means absent. Kinds: 0 
 grows one bucket at a time and no transaction ever rehashes the whole table. Byte layout:
 `programs/chains/src/table.rs`. A fresh chain starts with room for 32 entries.
 
+`launch` creates the state account even if someone has already sent lamports to its address
+(otherwise anyone could block a chain's launch for ~0.0009 SOL).
+
 **Rent.** Space costs rent on Solana (~6.96 SOL per MB). A call that needs new space must be
 preceded, in the same transaction, by `grow(id, bytes)`, paid in real SOL by the transaction's fee
 payer (up to 10 KB per instruction). Clients find out how much by simulating. Rent is not a chain fee
@@ -269,6 +272,9 @@ fee = (units + FEE_OVERHEAD_CU) × FEE_LAMPORTS_PER_MCU / 1,000,000
 - Pays half of the unclaimed fees to the chain's **current** Core asset owner and half to the
   `treasury` (odd lamport to the holder). Both are real lamports out of the header.
 - Fails with `ZeroAmount` if nothing has built up, `ChainEnded` after the end date.
+- **Burned NFT.** Core lets an owner burn their asset. If the chain's asset is burned, the holder's
+  share of `claim_fees` and `sweep` goes to the treasury instead (pass the treasury as `holder`),
+  so no funds can get stuck.
 
 ## 13. End dates and sweep
 

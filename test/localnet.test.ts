@@ -9,9 +9,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, TransactionInstruction } from '@solana/web3.js';
 import {
-  ix, pda, chainAccounts, balanceOf, nonceOf, guestAddress, decodeRegistry, opHash, u64be, keccak, type Event,
+  ix, pda, MPL_CORE_ID, chainAccounts, balanceOf, nonceOf, guestAddress, decodeRegistry, opHash, u64be, keccak, type Event,
 } from '../tools/chains.ts';
 import { Client } from '../tools/client.ts';
 import { assemble, word } from '../tools/asm.ts';
@@ -112,6 +112,8 @@ test('localnet rehearsal', { skip: up ? false : `no validator at ${RPC}`, timeou
   await t.test('launch: holder only, end date rule, block 1', async () => {
     await fails(launch(A, 2, 0n), 'NotHolder');
     await fails(launch(A, 3, (await now()) + 1n), 'BadExpiry');
+    // Someone pre-funds chain 1's state address; launching must still work.
+    await send([D], SystemProgram.transfer({ fromPubkey: D.publicKey, toPubkey: pda.state(1), lamports: 1_000_000 }));
     track(await launch(A, 1, 0n), [opHash('launch', A.publicKey.toBytes(), i64be(0n))]);
     endsAt = (await now()) + 40n;
     track(await launch(A, 3, endsAt));
@@ -244,6 +246,14 @@ test('localnet rehearsal', { skip: up ? false : `no validator at ${RPC}`, timeou
     await fails(call(B, 1, coll.address, 0n, words(3n, 1n, B.publicKey.toBytes()), codes), 'RequireFailed');
   });
 
+  await t.test('deep calls: MAX_DEPTH nested calls fit in a transaction', async () => {
+    const rec = await deploy(A, 1, assemble(readFileSync(new URL('../tools/apps/recurse.asm', import.meta.url), 'utf8')));
+    const deep = await call(A, 1, rec.address, 0n, words(8n), [rec.codeAcc]);
+    assert.equal(big(deep.ret!), 8n);
+    cuLog.push(`depth-8 call ${deep.cu} CU`);
+    await fails(call(A, 1, rec.address, 0n, words(9n), [rec.codeAcc]), 'DepthLimit');
+  });
+
   await t.test('fully backed: balances add up to total_deposits', async () => {
     const s = await state(1);
     const who = [A.publicKey, B.publicKey, C.publicKey, D.publicKey, pda.chain(1), new PublicKey(swap.address), new PublicKey(coll.address)];
@@ -282,21 +292,35 @@ test('localnet rehearsal', { skip: up ? false : `no validator at ${RPC}`, timeou
     await fails(dep(B, B.publicKey, SOL, 3), 'ChainEnded');
     await fails(send([D], ix('claim_fees', pay, { id: 3 })), 'ChainEnded');
 
+    // The holder burns the chain's NFT: the holder's share goes to the treasury instead of getting stuck.
+    await send([A], new TransactionInstruction({
+      programId: MPL_CORE_ID,
+      keys: [
+        { pubkey: pda.asset(3), isSigner: false, isWritable: true },
+        { pubkey: pda.collection(), isSigner: false, isWritable: true },
+        { pubkey: A.publicKey, isSigner: true, isWritable: true },
+        ...[MPL_CORE_ID, MPL_CORE_ID, MPL_CORE_ID].map((pubkey) => ({ pubkey, isSigner: false, isWritable: false })),
+      ],
+      data: Buffer.from([12, 0]), // BurnV1, no compression proof
+    }));
+    await fails(send([D], ix('sweep', pay, { id: 3 })), 'BadPayee');
+    const burned = { ...pay, holder: treasury };
+
     const h = await header(3);
     const fees = h.feesAccrued - h.feesClaimed;
     const stateLamports = BigInt(await conn.getBalance(pda.state(3)));
     const aBefore = BigInt(await conn.getBalance(A.publicKey));
     const tBefore = BigInt(await conn.getBalance(treasury));
-    const s = await send([D], ix('sweep', pay, { id: 3 }));
-    assert.equal(BigInt(await conn.getBalance(treasury)) - tBefore, fees / 2n);
-    assert.equal(BigInt(await conn.getBalance(A.publicKey)) - aBefore, h.totalDeposits - fees / 2n + stateLamports);
+    const s = await send([D], ix('sweep', burned, { id: 3 }));
+    assert.equal(BigInt(await conn.getBalance(treasury)) - tBefore, h.totalDeposits + stateLamports);
+    assert.equal(BigInt(await conn.getBalance(A.publicKey)), aBefore);
     assert.equal(await conn.getAccountInfo(pda.state(3)), null, 'state account closed');
     const after = await header(3);
     assert.equal(after.status, 1);
     assert.equal(after.totalDeposits, 0n);
     assert.equal(after.height, h.height, 'header keeps its final head and height');
     assert.ok(s.events.some((e) => e.name === 'Swept'));
-    await fails(send([D], ix('sweep', pay, { id: 3 })), 'AlreadySwept');
+    await fails(send([D], ix('sweep', burned, { id: 3 })), 'AlreadySwept');
   });
 
   t.diagnostic(`compute: ${cuLog.join(', ')}`);

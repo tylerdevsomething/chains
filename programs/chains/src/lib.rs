@@ -57,12 +57,44 @@ fn running(h: &ChainHeader, now: i64) -> Result<()> {
     Ok(())
 }
 
-/// Owner of a Metaplex Core asset (AssetV1: key byte 1, then the owner).
+/// Owner of a live Metaplex Core asset (AssetV1: key byte 1, then the owner), or None if the
+/// account isn't one (never created, or burned).
+fn live_asset_owner(asset: &AccountInfo) -> Option<Pubkey> {
+    if *asset.owner != mpl_core::ID {
+        return None;
+    }
+    let d = asset.try_borrow_data().ok()?;
+    (d.len() >= 33 && d[0] == 1).then(|| Pubkey::try_from(&d[1..33]).unwrap())
+}
+
 fn asset_owner(asset: &AccountInfo) -> Result<Pubkey> {
-    require_keys_eq!(*asset.owner, mpl_core::ID, ChainsError::BadAsset);
-    let d = asset.try_borrow_data()?;
-    require!(d.len() >= 33 && d[0] == 1, ChainsError::BadAsset);
-    Ok(Pubkey::try_from(&d[1..33]).unwrap())
+    live_asset_owner(asset).ok_or_else(|| ChainsError::BadAsset.into())
+}
+
+/// Who gets the holder's share of a payout (§12, §13): the asset's owner, or the treasury if the
+/// chain's NFT was burned, so funds can never get stuck.
+fn payee(asset: &AccountInfo, treasury: &Pubkey) -> Pubkey {
+    live_asset_owner(asset).unwrap_or(*treasury)
+}
+
+/// Creates a program-owned PDA even if someone already sent it lamports (which would make
+/// create_account fail and block it forever).
+fn create_pda<'info>(payer: &AccountInfo<'info>, target: &AccountInfo<'info>, system: &AccountInfo<'info>, seeds: &[&[u8]], space: usize) -> Result<()> {
+    let need = Rent::get()?.minimum_balance(space);
+    let have = target.lamports();
+    if have == 0 {
+        return system_program::create_account(
+            CpiContext::new_with_signer(system.clone(), system_program::CreateAccount { from: payer.clone(), to: target.clone() }, &[seeds]),
+            need,
+            space as u64,
+            &crate::ID,
+        );
+    }
+    if have < need {
+        system_program::transfer(CpiContext::new(system.clone(), system_program::Transfer { from: payer.clone(), to: target.clone() }), need - have)?;
+    }
+    system_program::allocate(CpiContext::new_with_signer(system.clone(), system_program::Allocate { account_to_allocate: target.clone() }, &[seeds]), space as u64)?;
+    system_program::assign(CpiContext::new_with_signer(system.clone(), system_program::Assign { account_to_assign: target.clone() }, &[seeds]), &crate::ID)
 }
 
 /// The header must always hold its rent plus every internal lamport (§1).
@@ -210,15 +242,12 @@ pub mod chains {
         // The state account: one table (§6), created here because it's raw bytes.
         let space = table::size_for(STATE_INITIAL_PAGES);
         let seeds: &[&[u8]] = &[SEED_STATE, &id.to_le_bytes(), &[ctx.bumps.state]];
-        system_program::create_account(
-            CpiContext::new_with_signer(
-                ctx.accounts.system_program.to_account_info(),
-                system_program::CreateAccount { from: ctx.accounts.holder.to_account_info(), to: ctx.accounts.state.to_account_info() },
-                &[seeds],
-            ),
-            Rent::get()?.minimum_balance(space),
-            space as u64,
-            &crate::ID,
+        create_pda(
+            &ctx.accounts.holder.to_account_info(),
+            &ctx.accounts.state.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            seeds,
+            space,
         )?;
         Table::init(&mut ctx.accounts.state.try_borrow_mut_data()?).map_err(table_err)?;
 
@@ -480,7 +509,7 @@ pub mod chains {
         let now = Clock::get()?.unix_timestamp;
         require!(ctx.accounts.header.status == STATUS_RUNNING, ChainsError::AlreadySwept);
         require!(!ctx.accounts.header.ended(now), ChainsError::ChainEnded);
-        require_keys_eq!(asset_owner(&ctx.accounts.asset)?, ctx.accounts.holder.key(), ChainsError::BadPayee);
+        require_keys_eq!(payee(&ctx.accounts.asset, &ctx.accounts.registry.treasury), ctx.accounts.holder.key(), ChainsError::BadPayee);
         let chain_addr = ctx.accounts.header.key().to_bytes();
         let amount = {
             let mut sd = ctx.accounts.state.try_borrow_mut_data()?;
@@ -510,7 +539,7 @@ pub mod chains {
         let now = Clock::get()?.unix_timestamp;
         require!(ctx.accounts.header.status == STATUS_RUNNING, ChainsError::AlreadySwept);
         require!(ctx.accounts.header.ended(now), ChainsError::NotEnded);
-        let holder_key = asset_owner(&ctx.accounts.asset)?;
+        let holder_key = payee(&ctx.accounts.asset, &ctx.accounts.registry.treasury);
         require_keys_eq!(holder_key, ctx.accounts.holder.key(), ChainsError::BadPayee);
         let chain_addr = ctx.accounts.header.key().to_bytes();
         let fees = {
@@ -735,10 +764,10 @@ pub struct Payout<'info> {
     /// CHECK: the chain's table.
     #[account(mut, seeds = [SEED_STATE, &id.to_le_bytes()], bump = header.state_bump)]
     pub state: UncheckedAccount<'info>,
-    /// CHECK: PDA checked; owner read from its data.
+    /// CHECK: PDA checked; owner read from its data (or burned).
     #[account(seeds = [SEED_ASSET, &id.to_le_bytes()], bump)]
     pub asset: UncheckedAccount<'info>,
-    /// CHECK: must be the asset's current owner (checked in the handler).
+    /// CHECK: the asset's current owner, or the treasury if it was burned (checked in the handler).
     #[account(mut)]
     pub holder: UncheckedAccount<'info>,
     /// CHECK: the registry's treasury.

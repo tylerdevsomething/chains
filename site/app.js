@@ -78,7 +78,7 @@ async function home() {
       <li>No sequencer, no bridge, no validators. Solana orders and finalizes everything.</li>
       <li>Anyone can check: the snapshot, every claim and every block can be rebuilt from public data.</li>
       <li>The fee rate is fixed at deploy. It can never be raised.</li>
-      <li>When a chain's end date passes, everyone can still withdraw. Leftovers go to the holder.</li>
+      <li>Chains can have an end date. Withdraw before it: after it, anything left inside goes to the chain's holder.</li>
     </ul>`;
 }
 
