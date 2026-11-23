@@ -9,15 +9,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import bs58 from 'bs58';
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
 import {
-  ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, Transaction, TransactionMessage,
-  VersionedTransaction, sendAndConfirmTransaction, type TransactionInstruction,
-} from '@solana/web3.js';
-import {
-  PROGRAM_ID, ix, pda, chainAccounts, balanceOf, nonceOf, guestAddress, decodeHeader, decodeRegistry, decodeEvent,
-  errorName, opHash, nextHead, u64be, keccak, type Event,
+  ix, pda, chainAccounts, balanceOf, nonceOf, guestAddress, decodeRegistry, opHash, u64be, keccak, type Event,
 } from '../tools/chains.ts';
+import { Client } from '../tools/client.ts';
 import { assemble, word } from '../tools/asm.ts';
 import { Snapshot } from '../tools/snapshot.ts';
 
@@ -32,52 +28,14 @@ const i64be = (n: bigint) => { const b = Buffer.alloc(8); b.writeBigInt64BE(n); 
 const words = (...ws: (bigint | string | Uint8Array)[]) => Buffer.concat(ws.map((w) => (w instanceof Uint8Array ? Buffer.from(w) : Buffer.from(word(w)))));
 const big = (w: Uint8Array) => BigInt('0x' + Buffer.from(w).toString('hex'));
 
-type Sent = { sig: string; events: Event[]; ret: Uint8Array | null; cu: number };
-
-async function send(signers: Keypair[], ...ixs: TransactionInstruction[]): Promise<Sent> {
-  const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...ixs);
-  const sig = await sendAndConfirmTransaction(conn, tx, signers, { commitment: 'confirmed' });
-  const t = await conn.getTransaction(sig, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
-  const keys = t!.transaction.message.staticAccountKeys;
-  const events: Event[] = [];
-  for (const inner of t!.meta!.innerInstructions ?? []) {
-    for (const i of inner.instructions) {
-      if (!keys[i.programIdIndex].equals(PROGRAM_ID)) continue;
-      const e = decodeEvent(Buffer.from(bs58.decode(i.data)));
-      if (e) events.push(e);
-    }
-  }
-  const rd = (t!.meta as unknown as { returnData?: { data: [string, string] } }).returnData;
-  return { sig, events, ret: rd ? Buffer.from(rd.data[0], 'base64') : null, cu: t!.meta!.computeUnitsConsumed ?? 0 };
-}
-
-async function fails(p: Promise<unknown>, name: string) {
-  try {
-    await p;
-  } catch (e) {
-    const s = String((e as Error).message) + JSON.stringify((e as { logs?: string[] }).logs ?? []);
-    const m = /custom program error: 0x([0-9a-f]+)/.exec(s);
-    const got = m ? errorName(parseInt(m[1], 16)) : s.slice(0, 300);
-    assert.equal(got, name);
-    return;
-  }
-  assert.fail(`expected ${name}`);
-}
-
-/** Simulates `read` and returns the guest's result word. */
-async function read(payer: Keypair, id: number, target: Uint8Array, data: Buffer, codes: PublicKey[]): Promise<Uint8Array | null> {
-  const i = ix('read', { caller: payer.publicKey, ...chainAccounts(id) }, { id, target: new PublicKey(target), data, max_steps: 10_000 },
-    codes.map((pubkey) => ({ pubkey, isSigner: false, isWritable: false })));
-  const { blockhash } = await conn.getLatestBlockhash();
-  const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: blockhash, instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), i] }).compileToV0Message();
-  const sim = await conn.simulateTransaction(new VersionedTransaction(msg), { sigVerify: false, replaceRecentBlockhash: true });
-  if (sim.value.err) throw new Error(`read failed: ${JSON.stringify(sim.value.err)} ${sim.value.logs?.join('\n')}`);
-  const rd = sim.value.returnData;
-  return rd ? Buffer.from(rd.data[0], 'base64') : null;
-}
-
-const state = async (id: number) => (await conn.getAccountInfo(pda.state(id)))!.data;
-const header = async (id: number) => decodeHeader((await conn.getAccountInfo(pda.chain(id)))!.data);
+const c = new Client(conn);
+const send = c.send.bind(c);
+const fails = c.fails.bind(c);
+const track = c.track.bind(c);
+const sendGrow = c.sendGrow.bind(c);
+const read = (payer: Keypair, id: number, target: Uint8Array, data: Buffer, codes: PublicKey[]) => c.read(payer.publicKey, id, target, data, codes);
+const state = c.state;
+const header = c.header;
 
 test('localnet rehearsal', { skip: up ? false : `no validator at ${RPC}`, timeout: 600_000 }, async (t) => {
   const admin = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(ADMIN_PATH, 'utf8'))));
@@ -90,40 +48,6 @@ test('localnet rehearsal', { skip: up ? false : `no validator at ${RPC}`, timeou
     await conn.confirmTransaction(s, 'confirmed');
   }
   assert.equal(await conn.getAccountInfo(pda.registry()), null, 'start from a fresh validator (scripts/localnet.sh)');
-
-  // History is checked against every BlockCommitted event we see, per chain.
-  const heads = new Map<number, { height: bigint; head: Uint8Array }>();
-  const seen = new Set<string>();
-  const track = (s: Sent, expectOps?: Uint8Array[]) => {
-    const blocks = s.events.filter((e): e is Extract<Event, { name: 'BlockCommitted' }> => e.name === 'BlockCommitted');
-    if (seen.has(s.sig)) {
-      // Already chained by a helper; just check the op hashes asked for.
-      expectOps?.forEach((op, k) => assert.deepEqual(new Uint8Array(blocks[k].opHash), op, 'op hash'));
-      return s;
-    }
-    seen.add(s.sig);
-    blocks.forEach((b, k) => {
-      const cur = heads.get(b.chain) ?? { height: 0n, head: new Uint8Array(32) };
-      assert.equal(b.height, cur.height + 1n);
-      assert.deepEqual(new Uint8Array(b.prev), cur.head);
-      assert.deepEqual(new Uint8Array(b.head), nextHead(cur.head, b.height, b.opHash));
-      if (expectOps) assert.deepEqual(new Uint8Array(b.opHash), expectOps[k], 'op hash');
-      heads.set(b.chain, { height: b.height, head: new Uint8Array(b.head) });
-    });
-    return s;
-  };
-
-  /** Sends; on NoSpace, grows the state account and tries again (§6: clients simulate and grow). */
-  async function sendGrow(id: number, signers: Keypair[], ...ixs: TransactionInstruction[]): Promise<Sent> {
-    for (let i = 0; ; i++) {
-      try {
-        return await send(signers, ...ixs);
-      } catch (e) {
-        if (i > 5 || !/custom program error: 0x([0-9a-f]+)/.test(String(e)) || errorName(parseInt(/0x([0-9a-f]+)/.exec(String(e))![1], 16)) !== 'NoSpace') throw e;
-        await send([signers[0]], ix('grow', { payer: signers[0].publicKey, ...chainAccounts(id) }, { id, bytes: 10_240 }));
-      }
-    }
-  }
 
   await t.test('initialize: only the upgrade authority', async () => {
     const args = { launch_authority: admin.publicKey, treasury, fee_lamports_per_mcu: RATE, uri_base: 'https://chains.example/' };
@@ -181,7 +105,7 @@ test('localnet rehearsal', { skip: up ? false : `no validator at ${RPC}`, timeou
     track(await launch(A, 2, endsAt));
     const h = await header(1);
     assert.equal(h.height, 1n);
-    assert.deepEqual(h.head, heads.get(1)!.head);
+    assert.deepEqual(h.head, c.heads.get(1)!.head);
     await assert.rejects(launch(A, 1, 0n), 'a chain launches once');
   });
 
@@ -317,8 +241,8 @@ test('localnet rehearsal', { skip: up ? false : `no validator at ${RPC}`, timeou
     const info = (await conn.getAccountInfo(pda.chain(1)))!;
     const rent = BigInt(await conn.getMinimumBalanceForRentExemption(info.data.length));
     assert.ok(BigInt(info.lamports) >= rent + h.totalDeposits);
-    assert.deepEqual(h.head, heads.get(1)!.head);
-    assert.equal(h.height, heads.get(1)!.height);
+    assert.deepEqual(h.head, c.heads.get(1)!.head);
+    assert.equal(h.height, c.heads.get(1)!.height);
   });
 
   await t.test('claim_fees: half to the holder, half to the treasury', async () => {

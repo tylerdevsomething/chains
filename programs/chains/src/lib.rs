@@ -10,7 +10,6 @@ pub mod u256;
 pub mod vm;
 
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::compute_units::sol_remaining_compute_units;
 use anchor_lang::solana_program::program::set_return_data;
 use anchor_lang::system_program;
 
@@ -22,7 +21,28 @@ use vm::{Host, Vm, Word};
 
 declare_id!("J42AjNw2JV9CHsm7Cp4wrrnahZMe5XKodhumsSHZDr1G");
 
-/// The chain fee for `cu_used` compute units (§11).
+/// Metered compute units for a transaction (§11): a fixed schedule calibrated to real compute,
+/// because the compute-units syscall is not active on devnet or mainnet.
+pub fn tx_units(steps: u64, reads: u64, writes: u64, logs: u64, calldata: u64) -> u64 {
+    steps * CU_PER_STEP + reads * CU_PER_READ + writes * CU_PER_WRITE + logs * CU_PER_LOG + calldata * CU_PER_CALLDATA_BYTE
+}
+
+/// Metered compute units for sealing `code_len` bytes of code (§11).
+pub fn seal_units(code_len: u64, reads: u64, writes: u64) -> u64 {
+    code_len * CU_PER_CODE_BYTE + reads * CU_PER_READ + writes * CU_PER_WRITE
+}
+
+/// On localnet only: real compute used so far, for calibrating the meter.
+#[cfg(feature = "localnet")]
+fn cu_left() -> u64 {
+    anchor_lang::solana_program::compute_units::sol_remaining_compute_units()
+}
+#[cfg(not(feature = "localnet"))]
+fn cu_left() -> u64 {
+    0
+}
+
+/// The chain fee for `cu_used` metered compute units (§11).
 pub fn chain_fee(cu_used: u64, lamports_per_mcu: u64) -> u64 {
     (((cu_used + FEE_OVERHEAD_CU) as u128 * lamports_per_mcu as u128) / 1_000_000) as u64
 }
@@ -292,7 +312,7 @@ pub mod chains {
         max_steps: u32,
         max_fee: u64,
     ) -> Result<()> {
-        let cu_start = sol_remaining_compute_units();
+        let cu_start = cu_left();
         running(&ctx.accounts.header, Clock::get()?.unix_timestamp)?;
         require!(data.len() <= vm::MAX_CALLDATA, ChainsError::CalldataTooLong);
         let sender = ctx.accounts.sender.key().to_bytes();
@@ -305,13 +325,20 @@ pub mod chains {
             let mut l = Ledger::new(Table::open(&mut sd).map_err(table_err)?);
             require!(!l.is_guest(&sender), ChainsError::GuestSigner);
             let nonce = l.use_nonce(&sender).map_err(vm_err)?;
-            let result = {
+            let (result, steps) = {
                 let mut m = Vm::new(&mut l, &env, max_steps as u64, false).map_err(vm_err)?;
-                m.call(&sender, &target.to_bytes(), value, &data, 0).map_err(vm_err)?
+                let r = m.call(&sender, &target.to_bytes(), value, &data, 0).map_err(vm_err)?;
+                (r, max_steps as u64 - m.steps_left)
             };
-            let fee = chain_fee(cu_start.saturating_sub(sol_remaining_compute_units()), rate);
+            let real = cu_start.saturating_sub(cu_left());
+            // The fee transfer below is one debit and one credit: 2 writes, counted in advance.
+            let units = tx_units(steps, l.reads.get(), l.writes + 2, l.logs.len() as u64, data.len() as u64);
+            let fee = chain_fee(units, rate);
             require!(fee <= max_fee, ChainsError::FeeTooHigh);
             l.transfer(&sender, &chain_addr, fee).map_err(vm_err)?;
+            if cfg!(feature = "localnet") {
+                msg!("meter real={} units={} steps={} reads={} writes={} logs={}", real, units, steps, l.reads.get(), l.writes, l.logs.len());
+            }
             (nonce, result, fee, std::mem::take(&mut l.logs))
         };
         drop(env);
@@ -401,7 +428,7 @@ pub mod chains {
     }
 
     pub fn deploy_seal(ctx: Context<DeploySeal>, id: u32, address: [u8; 32], max_fee: u64) -> Result<()> {
-        let cu_start = sol_remaining_compute_units();
+        let cu_start = cu_left();
         running(&ctx.accounts.header, Clock::get()?.unix_timestamp)?;
         let creator = ctx.accounts.creator.key();
         require_keys_eq!(ctx.accounts.code.creator, creator, ChainsError::NotCreator);
@@ -420,7 +447,12 @@ pub mod chains {
             let mut l = Ledger::new(Table::open(&mut sd).map_err(table_err)?);
             require!(!l.is_guest(&address), ChainsError::AddressOccupied);
             l.mark_guest(&address).map_err(vm_err)?;
-            let fee = chain_fee(cu_start.saturating_sub(sol_remaining_compute_units()), ctx.accounts.registry.fee_lamports_per_mcu);
+            let real = cu_start.saturating_sub(cu_left());
+            let units = seal_units(len as u64, l.reads.get(), l.writes + 2);
+            let fee = chain_fee(units, ctx.accounts.registry.fee_lamports_per_mcu);
+            if cfg!(feature = "localnet") {
+                msg!("meter real={} units={} seal len={}", real, units, len);
+            }
             require!(fee <= max_fee, ChainsError::FeeTooHigh);
             l.transfer(&creator.to_bytes(), &chain_addr, fee).map_err(vm_err)?;
             fee

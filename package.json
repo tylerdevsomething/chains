@@ -7,7 +7,8 @@
   },
   "scripts": {
     "test": "node --test test/*.test.ts",
-    "typecheck": "tsc --noEmit -p ."
+    "typecheck": "tsc --noEmit -p .",
+    "devnet": "node scripts/devnet.ts"
   },
   "devDependencies": {
     "@types/node": "^24.19.2",

@@ -230,10 +230,17 @@ must start an instruction. Everything else is 4 bytes.
 Each `transact` and `deploy_seal` pays a chain fee in SOL from the sender's internal balance:
 
 ```
-fee = (cu_used + FEE_OVERHEAD_CU) × FEE_LAMPORTS_PER_MCU / 1,000,000
+fee = (units + FEE_OVERHEAD_CU) × FEE_LAMPORTS_PER_MCU / 1,000,000
 ```
 
-- `cu_used` is measured by the program itself (`sol_remaining_compute_units` at the start and end).
+- `units` is metered from a fixed schedule, because the `sol_remaining_compute_units` syscall is not
+  active on devnet or mainnet (checked 2026-11-23):
+  - `transact`: 250 per step, 150 per table read, 300 per table write (the fee transfer counts as 2),
+    2,000 per log, and 1 per calldata byte.
+  - `deploy_seal`: 7 per code byte, plus the same read and write costs.
+  - `FEE_OVERHEAD_CU` = 20,000 covers the rest: transaction base cost, events and history.
+  The schedule was calibrated on localnet against real compute and is within about ±30% for the
+  example apps. It is part of the program, so it is frozen like the rate.
 - The sender sets `max_fee`. A higher fee fails with `FeeTooHigh`; a short balance fails with
   `InsufficientBalance`.
 - Deposits, withdrawals, reads and fee claims pay no chain fee. Failed operations pay nothing.

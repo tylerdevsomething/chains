@@ -1,7 +1,7 @@
 //! The ledger (§7) on top of the state table: balances, nonces, guest storage and guest markers,
 //! plus the read-only environment a transaction brings (code accounts, other listed accounts).
 
-use std::cell::Ref;
+use std::cell::{Cell, Ref};
 
 use anchor_lang::prelude::*;
 
@@ -43,15 +43,28 @@ fn no_space(e: TableError) -> VmError {
 pub struct Ledger<'a> {
     pub t: Table<'a>,
     pub logs: Vec<Log>,
+    /// Table lookups and writes so far, for the fee meter (§11).
+    pub reads: Cell<u64>,
+    pub writes: u64,
 }
 
 impl<'a> Ledger<'a> {
     pub fn new(t: Table<'a>) -> Self {
-        Ledger { t, logs: Vec::new() }
+        Ledger { t, logs: Vec::new(), reads: Cell::new(0), writes: 0 }
+    }
+
+    fn get(&self, k: &Word) -> Word {
+        self.reads.set(self.reads.get() + 1);
+        self.t.get(k)
+    }
+
+    fn put(&mut self, k: &Word, v: &Word) -> std::result::Result<(), VmError> {
+        self.writes += 1;
+        self.t.set(k, v).map_err(no_space)
     }
 
     pub fn set_balance(&mut self, addr: &Word, v: u64) -> std::result::Result<(), VmError> {
-        self.t.set(&key(KIND_BALANCE, addr, &ZERO), &word_u64(v)).map_err(no_space)
+        self.put(&key(KIND_BALANCE, addr, &ZERO), &word_u64(v))
     }
 
     pub fn credit(&mut self, addr: &Word, v: u64) -> std::result::Result<(), VmError> {
@@ -67,19 +80,19 @@ impl<'a> Ledger<'a> {
     /// Uses the next nonce of `addr` and returns the one used.
     pub fn use_nonce(&mut self, addr: &Word) -> std::result::Result<u64, VmError> {
         let k = key(KIND_NONCE, addr, &ZERO);
-        let n = u64_word(&self.t.get(&k));
-        self.t.set(&k, &word_u64(n + 1)).map_err(no_space)?;
+        let n = u64_word(&self.get(&k));
+        self.put(&k, &word_u64(n + 1))?;
         Ok(n)
     }
 
     pub fn mark_guest(&mut self, addr: &Word) -> std::result::Result<(), VmError> {
-        self.t.set(&key(KIND_GUEST, addr, &ZERO), &word_u64(1)).map_err(no_space)
+        self.put(&key(KIND_GUEST, addr, &ZERO), &word_u64(1))
     }
 }
 
 impl Host for Ledger<'_> {
     fn balance(&self, addr: &Word) -> u64 {
-        u64_word(&self.t.get(&key(KIND_BALANCE, addr, &ZERO)))
+        u64_word(&self.get(&key(KIND_BALANCE, addr, &ZERO)))
     }
 
     fn transfer(&mut self, from: &Word, to: &Word, lamports: u64) -> std::result::Result<(), VmError> {
@@ -91,15 +104,15 @@ impl Host for Ledger<'_> {
     }
 
     fn sload(&self, addr: &Word, slot: &Word) -> Word {
-        self.t.get(&key(KIND_STORAGE, addr, slot))
+        self.get(&key(KIND_STORAGE, addr, slot))
     }
 
     fn sstore(&mut self, addr: &Word, slot: &Word, value: &Word) -> std::result::Result<(), VmError> {
-        self.t.set(&key(KIND_STORAGE, addr, slot), value).map_err(no_space)
+        self.put(&key(KIND_STORAGE, addr, slot), value)
     }
 
     fn is_guest(&self, addr: &Word) -> bool {
-        self.t.get(&key(KIND_GUEST, addr, &ZERO)) != ZERO
+        self.get(&key(KIND_GUEST, addr, &ZERO)) != ZERO
     }
 
     fn log(&mut self, log: Log) -> std::result::Result<(), VmError> {

@@ -13,6 +13,13 @@ pub const MIN_EXPIRY: i64 = 5;
 pub const NAME_MAX: usize = 24;
 pub const URI_BASE_MAX: usize = 100;
 pub const FEE_OVERHEAD_CU: u64 = 20_000;
+/// The fee meter (§11). Calibrated on localnet against real compute.
+pub const CU_PER_STEP: u64 = 250;
+pub const CU_PER_READ: u64 = 150;
+pub const CU_PER_WRITE: u64 = 300;
+pub const CU_PER_LOG: u64 = 2_000;
+pub const CU_PER_CALLDATA_BYTE: u64 = 1;
+pub const CU_PER_CODE_BYTE: u64 = 7;
 /// Largest state account (Solana's account size limit).
 pub const STATE_MAX: usize = 10 * 1024 * 1024;
 /// Pages a fresh state account starts with (§6).
