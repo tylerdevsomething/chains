@@ -59,6 +59,7 @@ async function home() {
       <input name="q" placeholder="Search a chain number, address or transaction" autocomplete="off" spellcheck="false">
       <button class="btn primary">Search</button>
       <div class="err bad" id="search-err"></div>
+      <div class="live"><span class="pulse"></span><span id="live">live</span></div>
     </form>
 
     <div class="stats">
@@ -141,27 +142,149 @@ function wireRowLinks(root) {
   }));
 }
 
+const tokenAmt = (v) => {
+  const n = Number(v ?? 0);
+  return n >= 1e6 ? (n / 1e6).toLocaleString(undefined, { maximumFractionDigits: 2 }) + 'M' : n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+};
+
+/** A stable colour per address, for the little dots next to addresses and items. */
+function dot(addr) {
+  let h = 0;
+  for (const c of String(addr ?? '')) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return `hsl(${h % 360} 65% 60%)`;
+}
+
+/** One app as a card, with its live state when the app is a known kind. */
+function appCard(p, { chainTag = true } = {}) {
+  const st = p.state;
+  const href = `#/chain/${p.chain}/app/${esc(p.address)}`;
+  const head = `<div class="row"><a href="${href}"><h3>${esc(p.name ?? 'Unknown app')}</h3></a>${chainTag ? `<a class="dim" href="#/chain/${p.chain}">on #${p.chain}</a>` : ''}</div>`;
+  let body;
+  if (st?.kind === 'pool' && st.seeded) {
+    const tok = Number(st.tokenReserve);
+    const sup = Number(st.supply) || 1;
+    const out = Math.max(0, Math.min(100, (1 - tok / sup) * 100));
+    body = `
+      <div class="mono dim">Pool: SOL against ${esc(st.token)} (${esc(st.ticker)})</div>
+      <div class="big">1 SOL buys ${tokenAmt(st.tokensPerSol)} <span class="muted">${esc(st.ticker)}</span></div>
+      <div class="bar" title="${out.toFixed(1)}% of the supply has left the pool"><span style="width:${out.toFixed(1)}%"></span></div>
+      <div class="barlbl mono"><span>${sol(st.solReserve)} SOL in the pool</span><span>${tokenAmt(st.tokenReserve)} ${esc(st.ticker)}</span></div>
+      <div class="facts small">
+        <div><span class="k">Holders</span><span class="v">${num(st.holders)}</span></div>
+        <div><span class="k">Trades</span><span class="v">${num(st.trades)}</span></div>
+        <div><span class="k">Fee</span><span class="v">0.3% to ${acct(st.seeder)}</span></div>
+      </div>`;
+  } else if (st?.kind === 'collection' && st.created) {
+    const cap = Number(st.cap);
+    body = `
+      <div class="mono dim">Collection: anyone can mint for ${sol(st.price)} SOL</div>
+      <div class="big">${num(st.minted)} <span class="muted">of ${num(cap)} minted, ${num(st.owners)} owner${st.owners === 1 ? '' : 's'}</span></div>
+      ${st.items.length ? `<div class="chips">${st.items.slice(0, 15).map((it) => `<span class="chip" title="#${it.id}, held by ${esc(it.owner)}"><i style="background:${dot(it.owner)}"></i>${it.id}</span>`).join('')}</div>
+        ${st.minted > 15 ? `<div class="dim small">and ${num(st.minted - 15)} more</div>` : ''}` : ''}
+      <div class="facts small">
+        <div><span class="k">Price</span><span class="v">${sol(st.price)} SOL to ${acct(st.creator)}</span></div>
+        <div><span class="k">Supply</span><span class="v">${num(cap)} at most, ${num(Math.max(0, cap - st.minted))} left</span></div>
+        <div><span class="k">Metadata</span><span class="v mono" title="${esc(st.metaHash)}">${esc(short(st.metaHash, 6))}</span></div>
+      </div>`;
+  } else {
+    body = `
+      <div class="mono dim">${esc(short(p.address, 6))}</div>
+      <div class="big">${num(p.calls ?? 0)} <span class="muted">call${p.calls === 1 ? '' : 's'}</span></div>
+      <div class="facts small"><div><span class="k">Code</span><span class="v">${num(p.len)} bytes</span></div></div>`;
+  }
+  const foot = p.calls != null ? `<div class="dim small">${num(p.calls)} calls · ${num(p.callers)} callers · last used ${p.last ? esc(ago(p.last)) : 'never'}</div>` : '';
+  const label = st?.kind === 'pool' ? 'Open the pool' : st?.kind === 'collection' ? 'Open the collection' : 'Open the app';
+  return `<div class="card app">${head}${body}${foot}<a class="btn small" href="${href}">${label}</a></div>`;
+}
+
+function featuredCard(f) {
+  if (!f) return '';
+  const unpaid = BigInt(f.feesAccrued ?? 0) - BigInt(f.feesClaimed ?? 0);
+  return `<section class="featured">
+    <a class="art" href="#/chain/${f.id}"><img src="/chain/${f.id}.svg?t=${f.height}" alt="Chain #${f.id}" width="400" height="400"></a>
+    <div class="body">
+      <div class="eyebrow">Busiest chain</div>
+      <h2>Chain #${f.id}${f.name ? ` · ${esc(f.name)}` : ''} <span class="pill ${esc(f.status)}">${esc(f.status)}</span></h2>
+      <p class="muted">${esc(f.stone)}, ${esc(String(f.cut).toLowerCase())} cut. ${f.expiry ? `Ends ${esc(date(f.expiry))}.` : 'It has no end date.'}</p>
+      <div class="fstats">
+        <div><b>${num(f.height)}</b><span>blocks</span></div>
+        <div><b>${sol(f.totalDeposits, 3)}</b><span>SOL held</span></div>
+        <div><b>${num(f.accounts)}</b><span>accounts</span></div>
+        <div><b>${num(f.apps)}</b><span>apps</span></div>
+        <div><b>${sol(f.feesAccrued, 5)}</b><span>SOL in fees</span></div>
+      </div>
+      <div class="kv2">
+        <div><span>Holder</span>${acct(f.holder, 6)}</div>
+        <div><span>Chain account</span>${addrLink(f.address, 6)}</div>
+        <div><span>NFT</span>${addrLink(f.asset, 6)}</div>
+        <div><span>Fees not paid out</span>${sol(unpaid.toString(), 6)} SOL</div>
+      </div>
+      <a class="btn primary small" href="#/chain/${f.id}">Explore chain #${f.id}</a>
+    </div>
+  </section>`;
+}
+
+function tokensTable(tokens) {
+  if (!tokens.length) return '<div class="empty">No tokens or collections yet.</div>';
+  return `<table>
+    <tr><th>Name</th><th>Kind</th><th>Chain</th><th>App</th><th class="num">Holders</th><th class="num">Supply</th></tr>
+    ${tokens.map((t) => {
+      const st = t.state;
+      const pool = st.kind === 'pool';
+      return `<tr class="link" data-href="#/chain/${t.chain}/app/${esc(t.address)}">
+        <td><i class="dot" style="background:${dot(t.address)}"></i>${pool ? `${esc(st.token)} <span class="dim">${esc(st.ticker)}</span>` : `Collection <span class="dim mono">${esc(short(t.address))}</span>`}</td>
+        <td>${pool ? 'Token' : 'Collection'}</td>
+        <td><a href="#/chain/${t.chain}">#${t.chain}</a></td>
+        <td>${esc(t.name)} <span class="dim mono">${esc(short(t.address))}</span></td>
+        <td class="num">${num(pool ? st.holders : st.owners)}</td>
+        <td class="num">${pool ? tokenAmt(st.supply) : `${num(st.minted)} / ${num(st.cap)}`}</td></tr>`;
+    }).join('')}
+  </table>`;
+}
+
+function feedBlocks(blocks, apps) {
+  if (!blocks.length) return '<div class="empty">No blocks yet.</div>';
+  return `<table class="feed">${blocks.map((b) => `<tr class="link" data-href="#/chain/${b.chain}/block/${b.height}">
+    <td class="nowrap"><span class="op ${esc(b.op)}">${esc(OPS[b.op] ?? b.op)}</span></td>
+    <td><div class="small"><a href="#/chain/${b.chain}">#${b.chain}</a> · block <a class="mono" href="#/chain/${b.chain}/block/${b.height}">${b.height}</a></div>
+      <div>${describe(b, apps.filter((x) => x.chain === b.chain))}</div></td>
+    <td class="muted nowrap num">${esc(ago(b.time))}</td></tr>`).join('')}</table>`;
+}
+
+function feedEvents(events, apps) {
+  if (!events.length) return '<div class="empty">No events yet.</div>';
+  return `<table class="feed">${events.map((e) => `<tr class="link" data-href="#/chain/${e.chain}/block/${e.height}">
+    <td class="nowrap"><span class="ev ${esc(e.kind)}">${esc(EV[e.kind] ?? e.kind)}</span></td>
+    <td><div class="small"><a href="#/chain/${e.chain}">#${e.chain}</a> · block ${e.height}</div><div>${eventText(e, apps)}</div></td>
+    <td class="muted nowrap num">${esc(ago(e.time))}</td></tr>`).join('')}</table>`;
+}
+
+let liveTimer = null;
+
 async function renderActivity() {
   const el = document.getElementById('explorer');
   if (!el) return;
   let a;
-  try { a = await get('/api/activity'); } catch (e) { el.innerHTML = `<p class="muted">Activity unavailable: ${esc(e.message)}</p>`; return; }
+  try {
+    a = await get('/api/activity');
+  } catch (e) {
+    el.innerHTML = `<p class="muted">Activity unavailable: ${esc(e.message)}</p>`;
+    return;
+  }
   if (!document.body.contains(el)) return;
-
-  const appCard = (p) => `<div class="card app">
-      <div class="row"><a href="#/chain/${p.chain}/app/${esc(p.address)}"><h3>${esc(p.name ?? 'Unknown app')}</h3></a><a class="dim" href="#/chain/${p.chain}">on #${p.chain}</a></div>
-      <div class="mono dim">${esc(short(p.address, 6))}</div>
-      <div class="big">${num(p.calls)} <span class="muted">call${p.calls === 1 ? '' : 's'}</span></div>
-      <div class="facts small">
-        <div><span class="k">Callers</span><span class="v">${num(p.callers)}</span></div>
-        <div><span class="k">SOL sent in</span><span class="v">${sol(p.volume)}</span></div>
-        <div><span class="k">Code</span><span class="v">${num(p.len)} bytes</span></div>
-        <div><span class="k">Last used</span><span class="v">${p.last ? esc(ago(p.last)) : 'never'}</span></div>
-      </div>
-      <a class="btn small" href="#/chain/${p.chain}/app/${esc(p.address)}">Open the app</a>
-    </div>`;
+  const live = document.getElementById('live');
+  if (live) live.textContent = `live · updated ${new Date().toLocaleTimeString()}`;
 
   el.innerHTML = `
+    ${featuredCard(a.featured)}
+
+    <h2>Apps <span class="dim">${num(a.appCount)} deployed</span></h2>
+    <p class="muted sub">Programs that live inside the chains. Solana itself only sees the Chains program.</p>
+    ${a.apps.length ? `<div class="cards apps">${a.apps.map((p) => appCard(p)).join('')}</div>` : '<div class="panel"><div class="empty">No apps deployed yet.</div></div>'}
+
+    <h2>Tokens and collections</h2>
+    <div class="panel">${tokensTable(a.tokens)}</div>
+
     <h2>Most active chains</h2>
     <div class="panel">${a.top.length ? `<table>
       <tr><th>Chain</th><th>Holder</th><th class="num">Blocks</th><th class="num">Apps</th><th class="num">SOL held</th><th class="num">Fees earned</th><th>Last block</th></tr>
@@ -172,26 +295,24 @@ async function renderActivity() {
         <td class="muted nowrap">${esc(ago(c.last))}</td></tr>`).join('')}
     </table>` : '<div class="empty">No chain has launched yet.</div>'}</div>
 
-    <h2>Apps <span class="dim">${num(a.appCount)} deployed</span></h2>
-    ${a.apps.length ? `<div class="cards apps">${a.apps.map(appCard).join('')}</div>` : '<div class="panel"><div class="empty">No apps deployed yet.</div></div>'}
-
-    <h2>Latest blocks</h2>
-    <p class="muted sub">Every operation on a chain commits one block, linked by hash to the one before it.</p>
-    <div class="panel">${a.blocks.length ? `<table>
-      <tr><th>Chain</th><th class="num">Block</th><th>Op</th><th>What</th><th>When</th></tr>
-      ${blockRows(a.blocks, a.allApps)}
-    </table>` : '<div class="empty">No blocks yet.</div>'}</div>
-
-    <h2>Latest events</h2>
-    <p class="muted sub">Calls, transfers, deposits and app logs inside the chains.</p>
-    <div class="panel">${a.events.length ? `<table>
-      <tr><th>Chain</th><th class="num">Block</th><th>Event</th><th>What</th><th>When</th></tr>
-      ${a.events.map((e) => `<tr class="link" data-href="#/chain/${e.chain}/block/${e.height}">
-        <td><a href="#/chain/${e.chain}">#${e.chain}</a></td><td class="num mono">${e.height}</td>
-        <td><span class="ev ${esc(e.kind)}">${esc(EV[e.kind] ?? e.kind)}</span></td>
-        <td>${eventText(e, a.allApps)}</td><td class="muted nowrap">${esc(ago(e.time))}</td></tr>`).join('')}
-    </table>` : '<div class="empty">No events yet.</div>'}</div>`;
+    <div class="two">
+      <div>
+        <h2>Latest blocks</h2>
+        <p class="muted sub">Each operation commits one block, linked by hash to the one before.</p>
+        <div class="panel">${feedBlocks(a.blocks, a.allApps)}</div>
+      </div>
+      <div>
+        <h2>Latest events</h2>
+        <p class="muted sub">Calls, transfers, deposits and app logs inside the chains.</p>
+        <div class="panel">${feedEvents(a.events, a.allApps)}</div>
+      </div>
+    </div>`;
   wireRowLinks(el);
+
+  clearTimeout(liveTimer);
+  liveTimer = setTimeout(() => {
+    if (document.getElementById('explorer')) renderActivity();
+  }, 15000);
 }
 
 // ------------------------------------------------------------------ account
@@ -283,6 +404,11 @@ function tile(c) {
 
 const OPS = { launch: 'launch', deposit: 'deposit', withdraw: 'withdraw', transact: 'transaction', deploy_seal: 'deploy', claim_fees: 'claim fees' };
 
+const SELECTORS = {
+  Swap: { 1: 'seed', 2: 'buy', 3: 'sell', 4: 'balance_of', 5: 'transfer', 6: 'token_reserve', 7: 'sol_reserve' },
+  Collection: { 1: 'create', 2: 'mint', 3: 'transfer', 4: 'owner_of', 5: 'minted' },
+};
+
 function describe(b, apps) {
   const a = b.args;
   const appName = (addr) => {
@@ -298,7 +424,7 @@ function describe(b, apps) {
     case 'transact': {
       const name = appName(a.target);
       const sel = a.data && a.data.length >= 64 ? Number(BigInt('0x' + a.data.slice(0, 64))) : null;
-      const what = name ? `${name}${sel != null ? ` · call ${sel}` : ''}` : (a.data ? 'call' : 'transfer');
+      const what = name ? (SELECTORS[name]?.[sel] ?? (sel != null ? `call ${sel}` : '')) : (a.data ? 'call' : 'transfer');
       return `${acct(b.signer)} → ${name ? `<b>${esc(name)}</b> ` : ''}${acct(a.target)}${a.value !== '0' ? ` with ${sol(a.value)} SOL` : ''} <span class="dim">${esc(what)}</span>`;
     }
     default: return esc(b.op);
@@ -358,6 +484,7 @@ async function chain(id) {
     </section>
     ${c.stage === 'launched' ? `
     <h2>Apps <span class="dim">${c.apps.length}</span></h2>
+    ${c.apps.some((a) => a.state) ? `<div class="cards apps" style="margin-bottom:12px">${c.apps.filter((a) => a.state).map((a) => appCard({ ...a, chain: c.id }, { chainTag: false })).join('')}</div>` : ''}
     <div class="panel">${c.apps.length ? `<table>
       <tr><th>App</th><th>Address</th><th>Creator</th><th class="num">Code</th></tr>
       ${c.apps.map((a) => `<tr><td><a href="#/chain/${c.id}/app/${a.address}">${esc(a.name ?? 'Unknown app')}</a></td><td>${addrLink(a.address, 6)}</td><td>${addrLink(a.creator)}</td><td class="num">${num(a.len)} bytes</td></tr>`).join('')}
@@ -405,10 +532,17 @@ async function appPage(id, address) {
         <div><span class="k">Code</span><span class="v">${num(a.len)} bytes</span></div>
         <div><span class="k">Code hash</span><span class="v mono" title="${esc(a.codeHash)}">${esc(short(a.codeHash, 8))}</span></div>
       </div>
+      ${a.state ? `<h2>Right now</h2><div class="cards apps">${appCard({ ...a, chain: id, calls: null }, { chainTag: false })}</div>` : ''}
+      <h2>Calls <span class="dim">latest ${a.calls.length}</span></h2>
+      <div class="panel">${a.calls.length ? `<table>
+        <tr><th class="num">Block</th><th>What</th><th>When</th></tr>
+        ${a.calls.map((b) => `<tr class="link" data-href="#/chain/${id}/block/${b.height}"><td class="num mono"><a href="#/chain/${id}/block/${b.height}">${b.height}</a></td><td>${describe(b, [{ address: a.address, name: a.name }])}${b.logs.length ? ` <span class="dim">· ${b.logs.map((l) => esc(topicText(l.topics[0] ?? '00'))).join(', ')}</span>` : ''}</td><td class="muted nowrap">${esc(ago(b.time))}</td></tr>`).join('')}
+      </table>` : '<div class="empty">Nobody has called this app yet.</div>'}</div>
       <h2>Code</h2>
       <p class="muted">MiniVM code, disassembled. It was checked when it was deployed and can never change.</p>
       <pre class="code">${esc(a.disassembly)}</pre>
     </div>`;
+  wireRowLinks(app);
 }
 
 // ------------------------------------------------------------------ own a chain

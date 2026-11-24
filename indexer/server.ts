@@ -14,7 +14,7 @@ import { readFileSync } from 'node:fs';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Connection, PublicKey } from '@solana/web3.js';
-import { PROGRAM_ID, pda, balanceOf, nonceOf, type Header } from '../tools/chains.ts';
+import { PROGRAM_ID, pda, balanceOf, nonceOf, storageAt, wordToBig, keccak, type Header } from '../tools/chains.ts';
 import { assemble, disassemble } from '../tools/asm.ts';
 import { svg, metadata, traits, type ArtInput } from '../renderer/art.ts';
 import { Follower, codeHashOf, type Block } from './follower.ts';
@@ -133,7 +133,10 @@ async function api(path: string, url: URL, req: IncomingMessage, res: ServerResp
     const h = follower.history.get(id);
     return json(res, {
       ...base,
-      apps: apps.map((a) => ({ ...a, name: KNOWN.get(a.codeHash) ?? null })),
+      apps: await Promise.all(apps.map(async (a) => {
+        const name = KNOWN.get(a.codeHash) ?? null;
+        return { ...a, name, state: await appState(id, a.address, name).catch(() => null) };
+      })),
       accounts,
       history: (h?.blocks ?? []).slice(-500).reverse(),
       historyComplete: (h?.blocks.length ?? 0) === Number(row.header.height),
@@ -163,7 +166,9 @@ async function api(path: string, url: URL, req: IncomingMessage, res: ServerResp
     const c = await follower.code(id, m[2]);
     if (!c) return json(res, { error: 'no such app' }, 404);
     const hash = codeHashOf(c.code);
-    return json(res, { address: m[2], creator: c.creator, len: c.code.length, codeHash: hash, name: KNOWN.get(hash) ?? null, disassembly: disassemble(c.code) });
+    const name = KNOWN.get(hash) ?? null;
+    const calls = (follower.history.get(id)?.blocks ?? []).filter((b) => b.op === 'transact' && b.args.target === m![2]).slice(-100).reverse();
+    return json(res, { chain: id, address: m[2], creator: c.creator, len: c.code.length, codeHash: hash, name, state: await appState(id, m[2], name).catch(() => null), calls, disassembly: disassemble(c.code) });
   }
 
   m = /^\/api\/claim\/([1-9A-HJ-NP-Za-km-z]{32,44})(\/tx)?$/.exec(path);
@@ -200,6 +205,83 @@ function recentBlocks(n: number, keep: (b: Block) => boolean = () => true): Chai
 async function namedApps() {
   const apps = await follower.allApps().catch(() => []);
   return apps.map((a) => ({ ...a, name: KNOWN.get(a.codeHash) ?? null }));
+}
+
+const word = (n: bigint | number) => {
+  const b = Buffer.alloc(32);
+  let v = BigInt(n);
+  for (let i = 31; i >= 0 && v > 0n; i--, v >>= 8n) b[i] = Number(v & 255n);
+  return b;
+};
+const wordText = (w: Uint8Array) => {
+  const b = Buffer.from(w);
+  const end = b.indexOf(0) < 0 ? 32 : b.indexOf(0);
+  const t = b.subarray(0, end);
+  return t.length && [...t].every((c) => c >= 32 && c < 127) && b.subarray(end).every((c) => c === 0) ? t.toString('latin1') : '';
+};
+const isZero = (w: Uint8Array) => w.every((x) => x === 0);
+
+/** What a known app holds right now, read straight from its storage. */
+async function appState(chain: number, address: string, name: string | null) {
+  if (name !== 'Swap' && name !== 'Collection') return null;
+  const s = await follower.state(chain);
+  if (!s) return null;
+  const guest = new PublicKey(address).toBytes();
+  const at = (slot: Uint8Array) => storageAt(s, guest, slot);
+  const calls = (follower.history.get(chain)?.blocks ?? []).filter((b) => b.op === 'transact' && b.args.target === address);
+
+  if (name === 'Swap') {
+    const seeder = at(word(0));
+    const tokenReserve = wordToBig(at(word(1)));
+    const solReserve = wordToBig(at(word(2)));
+    const people = new Set<string>();
+    let trades = 0;
+    for (const b of calls) {
+      people.add(b.signer);
+      const d = b.args.data ?? '';
+      if (d.length >= 128 && BigInt('0x' + d.slice(0, 64)) === 5n) people.add(new PublicKey(Buffer.from(d.slice(64, 128), 'hex')).toBase58());
+      trades += b.logs.filter((l) => ['buy', 'sell'].includes(wordText(Buffer.from(l.topics[0] ?? '', 'hex')))).length;
+    }
+    let holders = 0;
+    for (const p of people) if (wordToBig(at(keccak(word(1), new PublicKey(p).toBytes()))) > 0n) holders++;
+    return {
+      kind: 'pool',
+      seeded: !isZero(seeder),
+      seeder: isZero(seeder) ? null : new PublicKey(seeder).toBase58(),
+      token: wordText(at(word(3))) || 'Token',
+      ticker: wordText(at(word(4))) || '?',
+      tokenReserve: tokenReserve.toString(),
+      solReserve: solReserve.toString(),
+      supply: '1000000',
+      tokensPerSol: solReserve > 0n ? ((tokenReserve * 1_000_000_000n) / solReserve).toString() : '0',
+      holders,
+      trades,
+    };
+  }
+
+  const creator = at(word(0));
+  const cap = wordToBig(at(word(2)));
+  const minted = Number(wordToBig(at(word(4))));
+  const owners = new Map<string, number>();
+  const items: { id: number; owner: string }[] = [];
+  for (let id = 1; id <= Math.min(minted, 300); id++) {
+    const o = at(keccak(word(2), word(id)));
+    if (isZero(o)) continue;
+    const k = new PublicKey(o).toBase58();
+    owners.set(k, (owners.get(k) ?? 0) + 1);
+    if (items.length < 24) items.push({ id, owner: k });
+  }
+  return {
+    kind: 'collection',
+    created: !isZero(creator),
+    creator: isZero(creator) ? null : new PublicKey(creator).toBase58(),
+    metaHash: Buffer.from(at(word(1))).toString('hex'),
+    cap: cap.toString(),
+    price: wordToBig(at(word(3))).toString(),
+    minted,
+    owners: owners.size,
+    items,
+  };
 }
 
 /** Home-page explorer data: busiest chains, apps with usage, latest blocks and events. */
@@ -249,9 +331,18 @@ async function activity() {
       case 'deploy_seal': events.push({ ...base, kind: 'deploy', who: b.signer, to: a.address }); break;
       default: events.push({ ...base, kind: b.op, who: b.signer });
     }
-    if (events.length >= 20) break;
+    if (events.length >= 16) break;
   }
-  return { top, apps: appsOut.slice(0, 6), appCount: apps.length, allApps: apps.map((a) => ({ chain: a.chain, address: a.address, name: a.name })), blocks, events: events.slice(0, 20) };
+  const withState = await Promise.all(appsOut.slice(0, 40).map(async (p) => ({ ...p, state: await appState(p.chain, p.address, p.name).catch(() => null) })));
+  const tokens = withState.filter((p) => p.state && (p.state.kind === 'pool' ? p.state.seeded : p.state.created));
+  let featured = null;
+  if (top[0]) {
+    const f = top[0];
+    const accounts = await follower.accounts(f.id).catch(() => []);
+    const row = follower.chains.get(f.id)!;
+    featured = { ...f, accounts: accounts.length, asset: pda.asset(f.id).toBase58(), address: pda.chain(f.id).toBase58(), launchedAt: Number(row.header!.launchedAt) };
+  }
+  return { featured, tokens: tokens.map(({ state, ...p }) => ({ ...p, state })), top, apps: withState.slice(0, 6), appCount: apps.length, allApps: apps.map((a) => ({ chain: a.chain, address: a.address, name: a.name })), blocks, events: events.slice(0, 16) };
 }
 
 /** Where a search box query should go. */
