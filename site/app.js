@@ -3,6 +3,7 @@
 
 import { claimPage } from './claim.js';
 import { chainPanel, appPanel } from './panels.js';
+import { snapshotPage } from './snapshot.js';
 
 const ctx = () => ({ exTx, reload: async () => { const y = window.scrollY; await route(); window.scrollTo(0, y); } });
 
@@ -570,7 +571,7 @@ async function own() {
       <p>Each 1,000,000 $CHAINS in your wallet at the snapshot is one claim. Nobody knows the exact snapshot slot in advance, us included: we announce a window, and the slot inside it is picked from a later Solana blockhash that anyone can check. The list, its hash and its Merkle root are published, so anyone can rebuild it from the token's public history.</p>
       <h2>2. Claim</h2>
       <p>For the first 24 hours after claiming opens, each wallet can claim one chain. After that, wallets with claims left use them, first come, first served, until all 500 are gone. Claiming doesn't burn or lock your tokens. Each claim mints a chain NFT to your wallet.</p>
-      <p><a class="btn primary" href="#/claim">Go to the claim page</a></p>
+      <p><a class="btn primary" href="#/claim">Go to the claim page</a> <a class="btn" href="#/snapshot">See the snapshot</a></p>
       <h2>3. Launch, or sell</h2>
       <p>Launch your chain to start earning: you pick the end date (at least 30 days away, or never). Or sell the NFT on any marketplace that lists Metaplex Core assets. Whoever holds it gets the holder's half of the fees.</p>
       <h2>What the holder can and can't do</h2>
@@ -589,13 +590,14 @@ async function route() {
   const h = location.hash.replace(/^#/, '') || '/';
   const parts = h.split('/').filter(Boolean);
   document.querySelectorAll('nav a').forEach((a) => a.classList.toggle('on',
-    (a.dataset.nav === 'home' && parts.length === 0) || (a.dataset.nav === 'chains' && (parts[0] === 'chains' || parts[0] === 'chain')) || (a.dataset.nav === 'own' && (parts[0] === 'own' || parts[0] === 'claim'))));
+    (a.dataset.nav === 'home' && parts.length === 0) || (a.dataset.nav === 'chains' && (parts[0] === 'chains' || parts[0] === 'chain')) || (a.dataset.nav === 'own' && (parts[0] === 'own' || parts[0] === 'claim')) || (a.dataset.nav === 'snapshot' && parts[0] === 'snapshot')));
   try {
     if (!overview) await loadOverview();
     if (parts.length === 0) await home();
     else if (parts[0] === 'chains') await chains();
     else if (parts[0] === 'own') await own();
     else if (parts[0] === 'claim') await claimPage(app, overview, exTx);
+    else if (parts[0] === 'snapshot') await snapshotPage(app, exAddr);
     else if (parts[0] === 'account') await accountPage(parts[1]);
     else if (parts[0] === 'chain' && parts[2] === 'block') await blockPage(Number(parts[1]), Number(parts[3]));
     else if (parts[0] === 'chain' && parts[2] === 'app') await appPage(Number(parts[1]), parts[3]);

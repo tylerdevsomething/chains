@@ -5,3 +5,7 @@ out/
 target/
 .anchor/
 test-ledger/
+
+# launch rehearsal output (scripts/rehearse-launch.ts)
+deploy/*.localnet.*
+deploy/snapshot-localnet-*/

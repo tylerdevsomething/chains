@@ -226,3 +226,15 @@ button.btn:disabled { opacity: .5; cursor: wait; }
   .use { grid-template-columns: 1fr; }
   .walletbox { margin-left: 0; }
 }
+
+/* snapshot timeline */
+.timeline { list-style: none; padding: 0; margin: 28px 0 0; position: relative; }
+.timeline::before { content: ''; position: absolute; left: 7px; top: 6px; bottom: 6px; width: 2px; background: var(--line); }
+.timeline li { display: grid; grid-template-columns: 16px 1fr; gap: 18px; padding-bottom: 26px; position: relative; }
+.timeline .dot { width: 16px; height: 16px; border-radius: 50%; background: var(--bg); border: 2px solid var(--dim); margin-top: 4px; position: relative; z-index: 1; }
+.timeline li.done .dot { background: var(--ok); border-color: var(--ok); }
+.timeline li.now .dot { background: var(--accent); border-color: var(--accent); box-shadow: 0 0 0 5px rgba(232,182,90,.18); }
+.timeline li.todo h3 { color: var(--muted); }
+.timeline h3 { margin: 0 0 6px; font-size: 18px; }
+.timeline li > div:last-child { min-width: 0; }
+pre.code.small { font-size: 12px; padding: 10px 14px; max-height: none; white-space: pre-wrap; word-break: break-all; }

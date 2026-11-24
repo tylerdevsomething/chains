@@ -11,6 +11,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Connection, PublicKey } from '@solana/web3.js';
@@ -42,7 +43,8 @@ const MAX_CHAINS = 500;
 const conn = new Connection(RPC_URL, 'confirmed');
 const follower = new Follower(conn, process.env.DATA_DIR ?? null);
 const actions = new Actions(conn);
-const claims = new Claims(conn, process.env.SNAPSHOT_FILE ?? fileURLToPath(new URL(`../deploy/snapshot.${CLUSTER}.csv`, import.meta.url)));
+const snapshotFile = () => process.env.SNAPSHOT_FILE ?? fileURLToPath(new URL(`../deploy/snapshot.${CLUSTER}.csv`, import.meta.url));
+const claims = new Claims(conn, snapshotFile());
 
 // Known apps, by code hash.
 const KNOWN = new Map<string, string>();
@@ -159,6 +161,8 @@ async function api(path: string, url: URL, req: IncomingMessage, res: ServerResp
   }
 
   if (path === '/api/activity') return json(res, await activity());
+
+  if (path === '/api/launch') return json(res, await launchInfo());
 
   m = /^\/api\/tx\/([1-9A-HJ-NP-Za-km-z]{32,44})$/.exec(path);
   if (m && req.method === 'POST') {
@@ -321,6 +325,44 @@ async function appState(chain: number, address: string, name: string | null) {
   };
 }
 
+/** Launch progress for the snapshot page: the announcement (deploy/announcement.<cluster>.json),
+ * the snapshot summary and the registry, with the current slot to turn slots into times. */
+async function launchInfo() {
+  const read = (name: string) => {
+    try {
+      return JSON.parse(readFileSync(fileURLToPath(new URL(`../deploy/${name}.${CLUSTER}.json`, import.meta.url)), 'utf8'));
+    } catch {
+      return null;
+    }
+  };
+  const ann = read('announcement');
+  const summary = read('snapshot');
+  const r = follower.registry;
+  const slot = await conn.getSlot('confirmed').catch(() => null);
+  let file: { sha256: string; wallets: number; claims: number } | null = null;
+  try {
+    const text = readFileSync(snapshotFile(), 'utf8');
+    const lines = text.trim().split('\n').filter(Boolean);
+    file = { sha256: createHash('sha256').update(text).digest('hex'), wallets: lines.length, claims: lines.reduce((a, l) => a + Number(l.split(',')[1] ?? 0), 0) };
+  } catch { /* not published */ }
+  return {
+    cluster: CLUSTER,
+    slot,
+    now: Math.floor(Date.now() / 1000),
+    mint: r && !r.chainsMint.equals(PublicKey.default) ? r.chainsMint.toBase58() : ann?.mint ?? null,
+    announcement: ann,
+    summary,
+    file,
+    onChain: r && {
+      snapshotSlot: Number(r.snapshotSlot),
+      root: Buffer.from(r.snapshotRoot).toString('hex'),
+      claimsOpenAt: Number(r.claimsOpenAt),
+      claimed: r.claimed,
+    },
+    claims: claims.problem,
+  };
+}
+
 /** Home-page explorer data: busiest chains, apps with usage, latest blocks and events. */
 async function activity() {
   const apps = await namedApps();
@@ -468,6 +510,26 @@ async function serve(req: IncomingMessage, res: ServerResponse) {
       return art[2] === 'svg'
         ? send(res, 200, svg(a), 'image/svg+xml', 'public, max-age=30')
         : send(res, 200, JSON.stringify(metadata(a, origin(req)), null, 2), 'application/json', 'public, max-age=30');
+    }
+
+    // The collection asset's metadata (the program points it at <uri_base>collection.json).
+    if (path === '/collection.json') {
+      const o = origin(req);
+      return send(res, 200, JSON.stringify({
+        name: 'Chains',
+        symbol: 'CHAIN',
+        description: '500 chains inside one Solana program. Each chain is an NFT: its holder earns half of the fees the chain takes.',
+        image: `${o}/chain/1.svg`,
+        external_url: `${o}/`,
+        properties: { files: [{ uri: `${o}/chain/1.svg`, type: 'image/svg+xml' }], category: 'image' },
+      }, null, 2), 'application/json', 'public, max-age=300');
+    }
+
+    // The published snapshot file, for anyone to download and check against the root on chain.
+    if (path === '/snapshot.csv') {
+      const f = snapshotFile();
+      const body = await readFile(f).catch(() => null);
+      return body ? send(res, 200, body, 'text/csv; charset=utf-8', 'public, max-age=60') : send(res, 404, 'not published yet', 'text/plain');
     }
 
     const rel = normalize(path === '/' ? '/index.html' : path).replace(/^([/\\])+/, '');

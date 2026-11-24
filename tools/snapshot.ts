@@ -46,6 +46,14 @@ export class Snapshot {
     }
   }
 
+  /** Reads a published file (the format file() writes). */
+  static parse(text: string): Snapshot {
+    return new Snapshot(text.trim().split('\n').filter(Boolean).map((line) => {
+      const [w, c] = line.split(',');
+      return { wallet: new PublicKey(w), claims: Number(c) };
+    }));
+  }
+
   get root(): Uint8Array {
     return this.levels[this.levels.length - 1][0];
   }
