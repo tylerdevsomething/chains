@@ -55,13 +55,21 @@ async function home() {
       </div>
     </section>
 
+    <form class="bigsearch" id="search">
+      <input name="q" placeholder="Search a chain number, address or transaction" autocomplete="off" spellcheck="false">
+      <button class="btn primary">Search</button>
+      <div class="err bad" id="search-err"></div>
+    </form>
+
     <div class="stats">
       <div class="stat"><div class="v">${num(claimed)}<span class="dim"> / ${o.maxChains}</span></div><div class="k">chains claimed</div></div>
       <div class="stat"><div class="v">${num(o.running)}</div><div class="k">chains running</div></div>
-      <div class="stat"><div class="v">${num(o.operations)}</div><div class="k">operations</div></div>
+      <div class="stat"><div class="v">${num(o.operations)}</div><div class="k">blocks</div></div>
       <div class="stat"><div class="v">${sol(o.totalDeposits, 2)}</div><div class="k">SOL held in chains</div></div>
       <div class="stat"><div class="v">${sol(o.feesAccrued, 4)}</div><div class="k">SOL earned in fees</div></div>
     </div>
+
+    <div id="explorer"><p class="muted pad">Loading activity…</p></div>
 
     <h2>How it works</h2>
     <div class="cards">
@@ -80,6 +88,156 @@ async function home() {
       <li>The fee rate is fixed at deploy. It can never be raised.</li>
       <li>Chains can have an end date. Withdraw before it: after it, anything left inside goes to the chain's holder.</li>
     </ul>`;
+
+  const form = document.getElementById('search');
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const q = form.q.value.trim();
+    if (!q) return;
+    const r = await get(`/api/search?q=${encodeURIComponent(q)}`).catch((err) => ({ error: err.message }));
+    if (r.go) location.hash = r.go;
+    else document.getElementById('search-err').textContent = r.error ?? '';
+  });
+
+  await renderActivity();
+}
+
+// ------------------------------------------------------------------ home explorer
+
+const EV = { call: 'call', transfer: 'transfer', log: 'log', deposit: 'deposit', withdraw: 'withdraw', deploy: 'deploy', launch: 'launch', claim_fees: 'claim fees' };
+const acct = (a, n = 4) => `<a class="mono" href="#/account/${esc(a)}" title="${esc(a)}">${esc(short(a, n))}</a>`;
+
+function appLabel(apps, chainId, addr) {
+  const a = apps.find((x) => x.chain === chainId && x.address === addr);
+  return a ? `<a href="#/chain/${chainId}/app/${esc(addr)}"><b>${esc(a.name ?? 'app')}</b></a> <span class="dim mono">${esc(short(addr))}</span>` : acct(addr);
+}
+
+function eventText(e, apps) {
+  switch (e.kind) {
+    case 'call': return `${acct(e.who)} called ${appLabel(apps, e.chain, e.to)}`;
+    case 'transfer': return `${acct(e.who)} sent ${sol(e.lamports)} SOL to ${appLabel(apps, e.chain, e.to)}`;
+    case 'log': return `${appLabel(apps, e.chain, e.who)} logged <span class="mono">${esc(topicText(e.text || '00'))}</span>`;
+    case 'deposit': return `${acct(e.who)} deposited ${sol(e.lamports)} SOL${e.to !== e.who ? ` for ${acct(e.to)}` : ''}`;
+    case 'withdraw': return `${acct(e.who)} withdrew ${sol(e.lamports)} SOL${e.to !== e.who ? ` to ${acct(e.to)}` : ''}`;
+    case 'deploy': return `${acct(e.who)} deployed ${appLabel(apps, e.chain, e.to)}`;
+    case 'launch': return `${acct(e.who)} launched the chain`;
+    case 'claim_fees': return `Fees paid out to the holder and treasury`;
+    default: return esc(e.kind);
+  }
+}
+
+function blockRows(blocks, apps, withChain = true) {
+  return blocks.map((b) => `<tr class="link" data-href="#/chain/${b.chain}/block/${b.height}">
+    ${withChain ? `<td><a href="#/chain/${b.chain}">#${b.chain}</a></td>` : ''}
+    <td class="num mono"><a href="#/chain/${b.chain}/block/${b.height}">${b.height}</a></td>
+    <td><span class="op ${esc(b.op)}">${esc(OPS[b.op] ?? b.op)}</span></td>
+    <td>${describe(b, apps.filter((a) => a.chain === b.chain))}</td>
+    <td class="muted nowrap" title="${esc(date(b.time))}">${esc(ago(b.time))}</td></tr>`).join('');
+}
+
+function wireRowLinks(root) {
+  root.querySelectorAll('tr.link').forEach((tr) => tr.addEventListener('click', (e) => {
+    if (!e.target.closest('a')) location.hash = tr.dataset.href;
+  }));
+}
+
+async function renderActivity() {
+  const el = document.getElementById('explorer');
+  if (!el) return;
+  let a;
+  try { a = await get('/api/activity'); } catch (e) { el.innerHTML = `<p class="muted">Activity unavailable: ${esc(e.message)}</p>`; return; }
+  if (!document.body.contains(el)) return;
+
+  const appCard = (p) => `<div class="card app">
+      <div class="row"><a href="#/chain/${p.chain}/app/${esc(p.address)}"><h3>${esc(p.name ?? 'Unknown app')}</h3></a><a class="dim" href="#/chain/${p.chain}">on #${p.chain}</a></div>
+      <div class="mono dim">${esc(short(p.address, 6))}</div>
+      <div class="big">${num(p.calls)} <span class="muted">call${p.calls === 1 ? '' : 's'}</span></div>
+      <div class="facts small">
+        <div><span class="k">Callers</span><span class="v">${num(p.callers)}</span></div>
+        <div><span class="k">SOL sent in</span><span class="v">${sol(p.volume)}</span></div>
+        <div><span class="k">Code</span><span class="v">${num(p.len)} bytes</span></div>
+        <div><span class="k">Last used</span><span class="v">${p.last ? esc(ago(p.last)) : 'never'}</span></div>
+      </div>
+      <a class="btn small" href="#/chain/${p.chain}/app/${esc(p.address)}">Open the app</a>
+    </div>`;
+
+  el.innerHTML = `
+    <h2>Most active chains</h2>
+    <div class="panel">${a.top.length ? `<table>
+      <tr><th>Chain</th><th>Holder</th><th class="num">Blocks</th><th class="num">Apps</th><th class="num">SOL held</th><th class="num">Fees earned</th><th>Last block</th></tr>
+      ${a.top.map((c) => `<tr class="link" data-href="#/chain/${c.id}">
+        <td><a class="chainref" href="#/chain/${c.id}"><img src="/chain/${c.id}.svg" alt="" width="28" height="28">#${c.id}${c.name ? ` · ${esc(c.name)}` : ''}</a> <span class="pill ${esc(c.status)}">${esc(c.status)}</span></td>
+        <td>${acct(c.holder)}</td><td class="num">${num(c.height)}</td><td class="num">${num(c.apps)}</td>
+        <td class="num">${sol(c.totalDeposits)}</td><td class="num">${sol(c.feesAccrued, 6)}</td>
+        <td class="muted nowrap">${esc(ago(c.last))}</td></tr>`).join('')}
+    </table>` : '<div class="empty">No chain has launched yet.</div>'}</div>
+
+    <h2>Apps <span class="dim">${num(a.appCount)} deployed</span></h2>
+    ${a.apps.length ? `<div class="cards apps">${a.apps.map(appCard).join('')}</div>` : '<div class="panel"><div class="empty">No apps deployed yet.</div></div>'}
+
+    <h2>Latest blocks</h2>
+    <p class="muted sub">Every operation on a chain commits one block, linked by hash to the one before it.</p>
+    <div class="panel">${a.blocks.length ? `<table>
+      <tr><th>Chain</th><th class="num">Block</th><th>Op</th><th>What</th><th>When</th></tr>
+      ${blockRows(a.blocks, a.allApps)}
+    </table>` : '<div class="empty">No blocks yet.</div>'}</div>
+
+    <h2>Latest events</h2>
+    <p class="muted sub">Calls, transfers, deposits and app logs inside the chains.</p>
+    <div class="panel">${a.events.length ? `<table>
+      <tr><th>Chain</th><th class="num">Block</th><th>Event</th><th>What</th><th>When</th></tr>
+      ${a.events.map((e) => `<tr class="link" data-href="#/chain/${e.chain}/block/${e.height}">
+        <td><a href="#/chain/${e.chain}">#${e.chain}</a></td><td class="num mono">${e.height}</td>
+        <td><span class="ev ${esc(e.kind)}">${esc(EV[e.kind] ?? e.kind)}</span></td>
+        <td>${eventText(e, a.allApps)}</td><td class="muted nowrap">${esc(ago(e.time))}</td></tr>`).join('')}
+    </table>` : '<div class="empty">No events yet.</div>'}</div>`;
+  wireRowLinks(el);
+}
+
+// ------------------------------------------------------------------ account
+
+async function accountPage(address) {
+  const a = await get(`/api/account/${address}`);
+  app.innerHTML = `
+    <div style="padding-top:28px">
+      <div class="crumbs"><a href="#/">Overview</a> / account</div>
+      <h1 style="font-size:30px;word-break:break-all" class="mono">${esc(a.address)}</h1>
+      <p><a href="${exAddr(a.address)}" target="_blank" rel="noopener">View on Solana Explorer</a></p>
+
+      <h2>Chains held <span class="dim">${a.holds.length}</span></h2>
+      ${a.holds.length ? `<div class="grid">${a.holds.map(tile).join('')}</div>` : '<div class="panel"><div class="empty">This address holds no chain NFTs.</div></div>'}
+
+      <h2>Balances inside chains</h2>
+      <div class="panel">${a.balances.length ? `<table>
+        <tr><th>Chain</th><th class="num">Balance (SOL)</th><th class="num">Nonce</th></tr>
+        ${a.balances.map((b) => `<tr><td><a href="#/chain/${b.chain}">#${b.chain}${b.name ? ` · ${esc(b.name)}` : ''}</a></td><td class="num">${sol(b.balance, 6)}</td><td class="num">${num(b.nonce)}</td></tr>`).join('')}
+      </table>` : '<div class="empty">No activity inside any chain.</div>'}</div>
+
+      <h2>Blocks <span class="dim">latest ${a.blocks.length}</span></h2>
+      <div class="panel">${a.blocks.length ? `<table>
+        <tr><th>Chain</th><th class="num">Block</th><th>Op</th><th>What</th><th>When</th></tr>
+        ${blockRows(a.blocks, a.apps)}
+      </table>` : '<div class="empty">No blocks involve this address.</div>'}</div>
+    </div>`;
+  wireRowLinks(app);
+}
+
+// ------------------------------------------------------------------ one block
+
+async function blockPage(id, height) {
+  const r = await get(`/api/chain/${id}/block/${height}`);
+  const b = r.block;
+  app.innerHTML = `
+    <div style="padding-top:28px">
+      <div class="crumbs"><a href="#/chains">All chains</a> / <a href="#/chain/${id}">#${id}</a> / block ${b.height}</div>
+      <h1 style="font-size:34px">Block ${b.height} <span class="op ${esc(b.op)}">${esc(OPS[b.op] ?? b.op)}</span></h1>
+      <p>${describe(b, r.apps)}</p>
+      <div class="btns" style="margin:12px 0 20px">
+        ${b.height > 1 ? `<a class="btn small" href="#/chain/${id}/block/${b.height - 1}">← Block ${b.height - 1}</a>` : ''}
+        <a class="btn small" href="#/chain/${id}/block/${b.height + 1}">Block ${b.height + 1} →</a>
+      </div>
+      <div class="panel" style="padding:8px 18px">${blockDetail(b)}</div>
+    </div>`;
 }
 
 // ------------------------------------------------------------------ all chains
@@ -132,16 +290,16 @@ function describe(b, apps) {
     return app ? (app.name ?? 'app') : null;
   };
   switch (b.op) {
-    case 'launch': return `Launched by ${addrLink(b.signer)}${a.expiry !== '0' ? `, ends ${date(Number(a.expiry))}` : ', no end date'}`;
-    case 'deposit': return `${sol(a.lamports)} SOL from ${addrLink(b.signer)} to ${addrLink(a.beneficiary)}`;
-    case 'withdraw': return `${sol(a.lamports)} SOL from ${addrLink(b.signer)} to ${addrLink(a.recipient)}`;
-    case 'deploy_seal': return `Deployed app ${addrLink(a.address)} by ${addrLink(b.signer)}`;
+    case 'launch': return `Launched by ${acct(b.signer)}${a.expiry !== '0' ? `, ends ${date(Number(a.expiry))}` : ', no end date'}`;
+    case 'deposit': return `${sol(a.lamports)} SOL from ${acct(b.signer)} to ${acct(a.beneficiary)}`;
+    case 'withdraw': return `${sol(a.lamports)} SOL from ${acct(b.signer)} to ${acct(a.recipient)}`;
+    case 'deploy_seal': return `Deployed app ${acct(a.address)} by ${acct(b.signer)}`;
     case 'claim_fees': return `Fees paid out to the holder and treasury`;
     case 'transact': {
       const name = appName(a.target);
       const sel = a.data && a.data.length >= 64 ? Number(BigInt('0x' + a.data.slice(0, 64))) : null;
       const what = name ? `${name}${sel != null ? ` · call ${sel}` : ''}` : (a.data ? 'call' : 'transfer');
-      return `${addrLink(b.signer)} → ${name ? `<b>${esc(name)}</b> ` : ''}${addrLink(a.target)}${a.value !== '0' ? ` with ${sol(a.value)} SOL` : ''} <span class="dim">${esc(what)}</span>`;
+      return `${acct(b.signer)} → ${name ? `<b>${esc(name)}</b> ` : ''}${acct(a.target)}${a.value !== '0' ? ` with ${sol(a.value)} SOL` : ''} <span class="dim">${esc(what)}</span>`;
     }
     default: return esc(b.op);
   }
@@ -290,6 +448,8 @@ async function route() {
     else if (parts[0] === 'chains') await chains();
     else if (parts[0] === 'own') await own();
     else if (parts[0] === 'claim') await claimPage(app, overview, exTx);
+    else if (parts[0] === 'account') await accountPage(parts[1]);
+    else if (parts[0] === 'chain' && parts[2] === 'block') await blockPage(Number(parts[1]), Number(parts[3]));
     else if (parts[0] === 'chain' && parts[2] === 'app') await appPage(Number(parts[1]), parts[3]);
     else if (parts[0] === 'chain') await chain(Number(parts[1]));
     else await home();

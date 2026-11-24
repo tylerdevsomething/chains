@@ -58,6 +58,8 @@ export class Follower {
   private stateCache = new Map<number, { at: number; data: Buffer | null }>();
   private appsCache = new Map<number, { at: number; apps: { address: string; account: string; creator: string; len: number; codeHash: string; sealed: boolean }[] }>();
 
+  private allAppsCache: { at: number; apps: { chain: number; address: string; account: string; creator: string; len: number; codeHash: string; sealed: boolean }[] } | null = null;
+
   constructor(conn: Connection, dataDir: string | null) {
     this.conn = conn;
     this.dataDir = dataDir;
@@ -216,6 +218,33 @@ export class Follower {
       })
       .filter((a) => a.sealed);
     this.appsCache.set(id, { at: Date.now(), apps });
+    return apps;
+  }
+
+  /** Every sealed app on every chain, in one call. */
+  async allApps() {
+    const c = this.allAppsCache;
+    if (c && Date.now() - c.at < 15000) return c.apps;
+    const list = await this.conn.getProgramAccounts(PROGRAM_ID, {
+      commitment: 'confirmed',
+      dataSlice: { offset: 0, length: 123 },
+      filters: [{ memcmp: { offset: 0, bytes: bs58.encode(CODE_DISC) } }],
+    });
+    const apps = list
+      .map(({ pubkey, account }) => {
+        const d = account.data;
+        return {
+          chain: d.readUInt32LE(8),
+          address: new PublicKey(d.subarray(12, 44)).toBase58(),
+          account: pubkey.toBase58(),
+          creator: new PublicKey(d.subarray(44, 76)).toBase58(),
+          sealed: d[85] === 1,
+          len: d.readUInt32LE(86),
+          codeHash: hex(d.subarray(90, 122)),
+        };
+      })
+      .filter((a) => a.sealed);
+    this.allAppsCache = { at: Date.now(), apps };
     return apps;
   }
 

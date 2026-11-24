@@ -14,10 +14,10 @@ import { readFileSync } from 'node:fs';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Connection, PublicKey } from '@solana/web3.js';
-import { PROGRAM_ID, pda, type Header } from '../tools/chains.ts';
+import { PROGRAM_ID, pda, balanceOf, nonceOf, type Header } from '../tools/chains.ts';
 import { assemble, disassemble } from '../tools/asm.ts';
 import { svg, metadata, traits, type ArtInput } from '../renderer/art.ts';
-import { Follower, codeHashOf } from './follower.ts';
+import { Follower, codeHashOf, type Block } from './follower.ts';
 import { Claims } from './claims.ts';
 
 const RPC_URL = process.env.RPC_URL ?? 'https://api.devnet.solana.com';
@@ -141,6 +141,22 @@ async function api(path: string, url: URL, req: IncomingMessage, res: ServerResp
     });
   }
 
+  if (path === '/api/activity') return json(res, await activity());
+
+  if (path === '/api/search') return json(res, search(url.searchParams.get('q') ?? ''));
+
+  m = /^\/api\/chain\/(\d+)\/block\/(\d+)$/.exec(path);
+  if (m) {
+    const id = Number(m[1]);
+    const b = follower.history.get(id)?.blocks.find((x) => x.height === Number(m![2]));
+    if (!b) return json(res, { error: 'no such block (yet)' }, 404);
+    const apps = (await follower.allApps().catch(() => [])).filter((a) => a.chain === id);
+    return json(res, { chain: id, block: b, apps: apps.map((a) => ({ ...a, name: KNOWN.get(a.codeHash) ?? null })) });
+  }
+
+  m = /^\/api\/account\/([1-9A-HJ-NP-Za-km-z]{32,44})$/.exec(path);
+  if (m) return json(res, await account(m[1]));
+
   m = /^\/api\/chain\/(\d+)\/app\/([1-9A-HJ-NP-Za-km-z]{32,44})$/.exec(path);
   if (m) {
     const id = Number(m[1]);
@@ -167,6 +183,118 @@ async function api(path: string, url: URL, req: IncomingMessage, res: ServerResp
   }
 
   return json(res, { error: 'not found' }, 404);
+}
+
+type ChainBlock = Block & { chain: number };
+
+/** Newest blocks across every chain. */
+function recentBlocks(n: number, keep: (b: Block) => boolean = () => true): ChainBlock[] {
+  const all: ChainBlock[] = [];
+  for (const [id, h] of follower.history) {
+    let k = 0;
+    for (let i = h.blocks.length - 1; i >= 0 && k < n; i--) if (keep(h.blocks[i])) { all.push({ ...h.blocks[i], chain: id }); k++; }
+  }
+  return all.sort((a, b) => (b.time ?? 0) - (a.time ?? 0) || b.height - a.height).slice(0, n);
+}
+
+async function namedApps() {
+  const apps = await follower.allApps().catch(() => []);
+  return apps.map((a) => ({ ...a, name: KNOWN.get(a.codeHash) ?? null }));
+}
+
+/** Home-page explorer data: busiest chains, apps with usage, latest blocks and events. */
+async function activity() {
+  const apps = await namedApps();
+  const usage = new Map<string, { calls: number; callers: Set<string>; volume: bigint; last: number }>();
+  const lastTime = new Map<number, number>();
+  for (const [id, h] of follower.history) {
+    lastTime.set(id, h.blocks[h.blocks.length - 1]?.time ?? 0);
+    for (const b of h.blocks) {
+      if (b.op !== 'transact') continue;
+      const k = `${id}:${b.args.target}`;
+      const u = usage.get(k) ?? { calls: 0, callers: new Set(), volume: 0n, last: 0 };
+      u.calls++;
+      u.callers.add(b.signer);
+      u.volume += BigInt(b.args.value ?? '0');
+      u.last = Math.max(u.last, b.time ?? 0);
+      usage.set(k, u);
+    }
+  }
+  const appsOut = apps
+    .map((a) => {
+      const u = usage.get(`${a.chain}:${a.address}`);
+      return { ...a, calls: u?.calls ?? 0, callers: u?.callers.size ?? 0, volume: (u?.volume ?? 0n).toString(), last: u?.last ?? 0 };
+    })
+    .sort((x, y) => y.calls - x.calls || y.last - x.last);
+
+  const top = [...follower.chains.values()]
+    .filter((r) => r.header)
+    .sort((a, b) => Number(b.header!.height - a.header!.height))
+    .slice(0, 8)
+    .map((r) => ({ ...chainSummary(r.id), apps: apps.filter((a) => a.chain === r.id).length, last: lastTime.get(r.id) ?? 0 }));
+
+  const blocks = recentBlocks(12);
+  const events: { chain: number; height: number; sig: string; time: number | null; kind: string; who: string; to?: string; lamports?: string; text?: string }[] = [];
+  for (const b of recentBlocks(30)) {
+    const base = { chain: b.chain, height: b.height, sig: b.sig, time: b.time };
+    const a = b.args;
+    switch (b.op) {
+      case 'transact':
+        events.push({ ...base, kind: 'call', who: b.signer, to: a.target });
+        if (a.value && a.value !== '0') events.push({ ...base, kind: 'transfer', who: b.signer, to: a.target, lamports: a.value });
+        for (const l of b.logs) events.push({ ...base, kind: 'log', who: l.address, text: l.topics[0] ?? '' });
+        break;
+      case 'deposit': events.push({ ...base, kind: 'deposit', who: b.signer, to: a.beneficiary, lamports: a.lamports }); break;
+      case 'withdraw': events.push({ ...base, kind: 'withdraw', who: b.signer, to: a.recipient, lamports: a.lamports }); break;
+      case 'deploy_seal': events.push({ ...base, kind: 'deploy', who: b.signer, to: a.address }); break;
+      default: events.push({ ...base, kind: b.op, who: b.signer });
+    }
+    if (events.length >= 20) break;
+  }
+  return { top, apps: appsOut.slice(0, 6), appCount: apps.length, allApps: apps.map((a) => ({ chain: a.chain, address: a.address, name: a.name })), blocks, events: events.slice(0, 20) };
+}
+
+/** Where a search box query should go. */
+function search(raw: string) {
+  const q = raw.trim().replace(/^#/, '');
+  if (/^\d+$/.test(q)) {
+    const id = Number(q);
+    return id >= 1 && id <= MAX_CHAINS ? { go: `#/chain/${id}` } : { error: `Chain ids run from 1 to ${MAX_CHAINS}.` };
+  }
+  if (/^[1-9A-HJ-NP-Za-km-z]{80,90}$/.test(q)) {
+    for (const [id, h] of follower.history) {
+      const b = h.blocks.find((x) => x.sig === q);
+      if (b) return { go: `#/chain/${id}/block/${b.height}` };
+    }
+    return { error: "That transaction isn't a Chains block (or the indexer hasn't seen it yet)." };
+  }
+  if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(q)) {
+    for (let id = 1; id <= MAX_CHAINS; id++) {
+      const p = [pda.chain(id), pda.asset(id), pda.state(id)].map((k) => k.toBase58());
+      if (p.includes(q)) return { go: `#/chain/${id}` };
+      if (!follower.chains.has(id)) break;
+    }
+    for (const [id, h] of follower.history) {
+      if (h.blocks.some((b) => b.op === 'deploy_seal' && b.args.address === q)) return { go: `#/chain/${id}/app/${q}` };
+    }
+    return { go: `#/account/${q}` };
+  }
+  return { error: 'Search by chain number, address or transaction signature.' };
+}
+
+/** One address across every chain: chains it holds, balances inside chains, recent blocks. */
+async function account(address: string) {
+  const holds = [...follower.chains.values()].filter((r) => r.holder === address).map((r) => chainSummary(r.id));
+  const inChains: number[] = [];
+  for (const [id, h] of follower.history) if (h.blocks.some((b) => b.signer === address || b.addresses.includes(address))) inChains.push(id);
+  const key = new PublicKey(address);
+  const balances = [];
+  for (const id of inChains) {
+    const s = await follower.state(id);
+    if (s) balances.push({ chain: id, name: follower.chains.get(id)?.header?.name ?? '', balance: balanceOf(s, key).toString(), nonce: nonceOf(s, key).toString() });
+  }
+  const blocks = recentBlocks(50, (b) => b.signer === address || b.addresses.includes(address));
+  return { address, holds, balances, blocks, apps: await namedApps() };
 }
 
 const TYPES: Record<string, string> = {
