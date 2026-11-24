@@ -10,8 +10,7 @@ const span = (s) => {
   return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`;
 };
 
-const provider = () => window.phantom?.solana ?? window.solana ?? null;
-let wallet = null;
+import { provider, wallet, connect, disconnect, onWallet } from './wallet.js';
 
 export async function claimPage(app, overview, exTx) {
   const cluster = overview.cluster;
@@ -27,7 +26,7 @@ export async function claimPage(app, overview, exTx) {
       body = statusHtml(s);
     }
     app.innerHTML = `
-      <div style="max-width:720px;padding-top:28px">
+      <div class="claim-page" style="max-width:720px;padding-top:28px">
         <div class="crumbs"><a href="#/own">Own a chain</a> / claim</div>
         <h1 style="font-size:40px">Claim chains</h1>
         ${cluster !== 'mainnet-beta' ? `<p class="note">This is the ${esc(cluster)} preview. Switch your wallet to ${esc(cluster)} (in Phantom: Settings → Developer settings → Testnet mode) before claiming.</p>` : ''}
@@ -43,8 +42,7 @@ export async function claimPage(app, overview, exTx) {
       </div>`;
     app.querySelector('#connect')?.addEventListener('click', async () => {
       try {
-        const r = await provider().connect();
-        wallet = r.publicKey.toString();
+        await connect();
         render();
       } catch (e) {
         render(`<span class="bad">${esc(e.message ?? 'Connection refused.')}</span>`);
@@ -52,8 +50,7 @@ export async function claimPage(app, overview, exTx) {
     });
     app.querySelector('#disconnect')?.addEventListener('click', (e) => {
       e.preventDefault();
-      wallet = null;
-      provider()?.disconnect?.();
+      disconnect();
       render();
     });
     app.querySelectorAll('button[data-n]').forEach((b) => b.addEventListener('click', () => claim(Number(b.dataset.n))));
@@ -87,6 +84,6 @@ export async function claimPage(app, overview, exTx) {
     }
   };
 
-  if (!wallet && provider()?.isConnected && provider()?.publicKey) wallet = provider().publicKey.toString();
+  const off = onWallet(() => (app.querySelector('.claim-page') ? render() : off()));
   await render();
 }

@@ -2,6 +2,9 @@
 // Data comes from the service's /api (indexer/server.ts); art from /chain/<id>.svg.
 
 import { claimPage } from './claim.js';
+import { chainPanel, appPanel } from './panels.js';
+
+const ctx = () => ({ exTx, reload: async () => { const y = window.scrollY; await route(); window.scrollTo(0, y); } });
 
 const app = document.getElementById('app');
 let overview = null;
@@ -328,6 +331,13 @@ async function accountPage(address) {
       <h2>Chains held <span class="dim">${a.holds.length}</span></h2>
       ${a.holds.length ? `<div class="grid">${a.holds.map(tile).join('')}</div>` : '<div class="panel"><div class="empty">This address holds no chain NFTs.</div></div>'}
 
+      ${a.tokens.length || a.items.length ? `<h2>Tokens and items</h2>
+      <div class="panel"><table>
+        <tr><th>Chain</th><th>App</th><th>Holding</th></tr>
+        ${a.tokens.map((t) => `<tr class="link" data-href="#/chain/${t.chain}/app/${esc(t.app)}"><td><a href="#/chain/${t.chain}">#${t.chain}</a></td><td>${esc(t.token || 'Token')} <span class="dim mono">${esc(short(t.app))}</span></td><td class="num">${Number(t.balance).toLocaleString()} ${esc(t.ticker)}</td></tr>`).join('')}
+        ${a.items.map((t) => `<tr class="link" data-href="#/chain/${t.chain}/app/${esc(t.app)}"><td><a href="#/chain/${t.chain}">#${t.chain}</a></td><td>Collection <span class="dim mono">${esc(short(t.app))}</span></td><td class="num">${t.ids.length} item${t.ids.length === 1 ? '' : 's'}: ${t.ids.slice(0, 20).map((i) => '#' + i).join(', ')}</td></tr>`).join('')}
+      </table></div>` : ''}
+
       <h2>Balances inside chains</h2>
       <div class="panel">${a.balances.length ? `<table>
         <tr><th>Chain</th><th class="num">Balance (SOL)</th><th class="num">Nonce</th></tr>
@@ -457,7 +467,7 @@ async function chain(id) {
   const status = c.stage === 'launched' ? c.status : c.stage;
   const title = `Chain #${c.id}${c.name ? ` · ${esc(c.name)}` : ''}`;
   const facts = c.stage === 'launched' ? [
-    ['Holder', addrLink(c.holder, 6)],
+    ['Holder', acct(c.holder, 6)],
     ['Status', esc(status)],
     ['Operations', num(c.height)],
     ['SOL held', `${sol(c.totalDeposits)} SOL`],
@@ -482,6 +492,8 @@ async function chain(id) {
         <div class="facts">${facts.map(([k, v]) => `<div><span class="k">${k}</span><span class="v">${v}</span></div>`).join('')}</div>
       </div>
     </section>
+    <h2>${c.stage === 'launched' ? 'Use this chain' : c.stage === 'claimed' ? 'Not launched yet' : 'Unclaimed'}</h2>
+    <div id="use"></div>
     ${c.stage === 'launched' ? `
     <h2>Apps <span class="dim">${c.apps.length}</span></h2>
     ${c.apps.some((a) => a.state) ? `<div class="cards apps" style="margin-bottom:12px">${c.apps.filter((a) => a.state).map((a) => appCard({ ...a, chain: c.id }, { chainTag: false })).join('')}</div>` : ''}
@@ -496,7 +508,7 @@ async function chain(id) {
       ${c.accounts.map((a) => {
         const app = c.apps.find((x) => x.address === a.address);
         const label = a.chain ? 'the chain (unclaimed fees)' : app ? (app.name ?? 'app') : '';
-        return `<tr><td>${addrLink(a.address, 6)}</td><td class="muted">${esc(label)}</td><td class="num">${sol(a.balance, 6)}</td><td class="num">${num(a.nonce)}</td></tr>`;
+        return `<tr><td>${acct(a.address, 6)}</td><td class="muted">${esc(label)}</td><td class="num">${sol(a.balance, 6)}</td><td class="num">${num(a.nonce)}</td></tr>`;
       }).join('')}
     </table>` : '<div class="empty">No balances yet.</div>'}</div>
 
@@ -505,9 +517,8 @@ async function chain(id) {
     <div class="panel">${c.history.length ? `<table id="hist">
       <tr><th class="num">Block</th><th>Op</th><th>What</th><th>When</th></tr>
       ${c.history.map((b, i) => `<tr class="blk" data-i="${i}"><td class="num mono">${b.height}</td><td><span class="op ${esc(b.op)}">${esc(OPS[b.op] ?? b.op)}</span></td><td>${describe(b, c.apps)}</td><td class="muted" title="${esc(date(b.time))}">${esc(ago(b.time))}</td></tr>`).join('')}
-    </table>` : '<div class="empty">No blocks yet.</div>'}</div>` : `
-    <h2>Not running yet</h2>
-    <p class="note">${c.stage === 'claimed' ? 'This chain has been claimed. It starts keeping history when its holder launches it.' : 'Nobody has claimed this chain yet. Claims open to $CHAINS holders after the snapshot.'}</p>`}`;
+    </table>` : '<div class="empty">No blocks yet.</div>'}</div>` : ''}`;
+  chainPanel(document.getElementById('use'), c, ctx());
 
   app.querySelectorAll('tr.blk').forEach((tr) => tr.addEventListener('click', (e) => {
     if (e.target.closest('a')) return;
@@ -532,6 +543,8 @@ async function appPage(id, address) {
         <div><span class="k">Code</span><span class="v">${num(a.len)} bytes</span></div>
         <div><span class="k">Code hash</span><span class="v mono" title="${esc(a.codeHash)}">${esc(short(a.codeHash, 8))}</span></div>
       </div>
+      <h2>Use this app</h2>
+      <div id="use-app"></div>
       ${a.state ? `<h2>Right now</h2><div class="cards apps">${appCard({ ...a, chain: id, calls: null }, { chainTag: false })}</div>` : ''}
       <h2>Calls <span class="dim">latest ${a.calls.length}</span></h2>
       <div class="panel">${a.calls.length ? `<table>
@@ -543,6 +556,7 @@ async function appPage(id, address) {
       <pre class="code">${esc(a.disassembly)}</pre>
     </div>`;
   wireRowLinks(app);
+  appPanel(document.getElementById("use-app"), { ...a, chain: id }, ctx());
 }
 
 // ------------------------------------------------------------------ own a chain

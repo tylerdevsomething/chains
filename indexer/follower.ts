@@ -55,6 +55,11 @@ export class Follower {
   chains = new Map<number, ChainRow>();
   history = new Map<number, History>();
   updatedAt = 0;
+  private wake: (() => void) | null = null;
+  /** Refresh now (after a user's transaction lands). */
+  poke() {
+    this.wake?.();
+  }
   private stateCache = new Map<number, { at: number; data: Buffer | null }>();
   private appsCache = new Map<number, { at: number; apps: { address: string; account: string; creator: string; len: number; codeHash: string; sealed: boolean }[] }>();
 
@@ -264,7 +269,11 @@ export class Follower {
       } catch (e) {
         console.error('follower:', (e as Error).message);
       }
-      await sleep(everyMs);
+      await new Promise<void>((r) => {
+        const timer = setTimeout(r, everyMs);
+        this.wake = () => { clearTimeout(timer); r(); };
+      });
+      this.wake = null;
     }
   }
 }

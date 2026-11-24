@@ -19,6 +19,19 @@ import { assemble, disassemble } from '../tools/asm.ts';
 import { svg, metadata, traits, type ArtInput } from '../renderer/art.ts';
 import { Follower, codeHashOf, type Block } from './follower.ts';
 import { Claims } from './claims.ts';
+import { Actions, ActionError } from './actions.ts';
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let d = '';
+    req.on('data', (c) => {
+      d += c;
+      if (d.length > 10_000) reject(new Error('too large'));
+    });
+    req.on('end', () => resolve(d));
+    req.on('error', reject);
+  });
+}
 
 const RPC_URL = process.env.RPC_URL ?? 'https://api.devnet.solana.com';
 const CLUSTER = process.env.CLUSTER ?? 'devnet';
@@ -28,6 +41,7 @@ const MAX_CHAINS = 500;
 
 const conn = new Connection(RPC_URL, 'confirmed');
 const follower = new Follower(conn, process.env.DATA_DIR ?? null);
+const actions = new Actions(conn);
 const claims = new Claims(conn, process.env.SNAPSHOT_FILE ?? fileURLToPath(new URL(`../deploy/snapshot.${CLUSTER}.csv`, import.meta.url)));
 
 // Known apps, by code hash.
@@ -145,6 +159,29 @@ async function api(path: string, url: URL, req: IncomingMessage, res: ServerResp
   }
 
   if (path === '/api/activity') return json(res, await activity());
+
+  m = /^\/api\/tx\/([1-9A-HJ-NP-Za-km-z]{32,44})$/.exec(path);
+  if (m && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = JSON.parse(await readBody(req));
+    } catch {
+      return json(res, { error: 'bad request body' }, 400);
+    }
+    try {
+      return json(res, await actions.build(new PublicKey(m[1]), body));
+    } catch (e) {
+      if (e instanceof ActionError) return json(res, { error: e.message }, 400);
+      throw e;
+    }
+  }
+
+  m = /^\/api\/sig\/([1-9A-HJ-NP-Za-km-z]{80,90})$/.exec(path);
+  if (m) {
+    const st = (await conn.getSignatureStatuses([m[1]])).value[0];
+    if (st?.confirmationStatus && st.confirmationStatus !== 'processed') setTimeout(() => follower.poke(), 0);
+    return json(res, { status: st?.confirmationStatus ?? null, err: st?.err ?? null });
+  }
 
   if (path === '/api/search') return json(res, search(url.searchParams.get('q') ?? ''));
 
@@ -385,7 +422,31 @@ async function account(address: string) {
     if (s) balances.push({ chain: id, name: follower.chains.get(id)?.header?.name ?? '', balance: balanceOf(s, key).toString(), nonce: nonceOf(s, key).toString() });
   }
   const blocks = recentBlocks(50, (b) => b.signer === address || b.addresses.includes(address));
-  return { address, holds, balances, blocks, apps: await namedApps() };
+  const apps = await namedApps();
+  return { address, holds, balances, blocks, apps, ...(await holdings(key, apps)) };
+}
+
+/** Tokens in Swap pools and items in Collections that an address holds, across every chain. */
+async function holdings(key: PublicKey, apps: Awaited<ReturnType<typeof namedApps>>) {
+  const me = Buffer.from(key.toBytes());
+  const tokens: { chain: number; app: string; token: string; ticker: string; balance: string }[] = [];
+  const items: { chain: number; app: string; ids: number[] }[] = [];
+  for (const a of apps.slice(0, 80)) {
+    if (a.name !== 'Swap' && a.name !== 'Collection') continue;
+    const st = await follower.state(a.chain);
+    if (!st) continue;
+    const g = new PublicKey(a.address).toBytes();
+    if (a.name === 'Swap') {
+      const bal = wordToBig(storageAt(st, g, keccak(word(1), me)));
+      if (bal > 0n) tokens.push({ chain: a.chain, app: a.address, token: wordText(storageAt(st, g, word(3))), ticker: wordText(storageAt(st, g, word(4))), balance: bal.toString() });
+    } else {
+      const minted = Number(wordToBig(storageAt(st, g, word(4))));
+      const ids: number[] = [];
+      for (let i = 1; i <= Math.min(minted, 500); i++) if (me.equals(Buffer.from(storageAt(st, g, keccak(word(2), word(i)))))) ids.push(i);
+      if (ids.length) items.push({ chain: a.chain, app: a.address, ids });
+    }
+  }
+  return { tokens, items };
 }
 
 const TYPES: Record<string, string> = {
